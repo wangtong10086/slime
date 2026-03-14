@@ -58,6 +58,12 @@ def init_wandb_primary(args):
         "config": _compute_config_for_logging(args),
     }
 
+    # Allow external launchers to pre-assign a run id so auxiliary processes
+    # can attach to the same shared W&B run.
+    if args.wandb_run_id:
+        init_kwargs["id"] = args.wandb_run_id
+        init_kwargs["resume"] = "allow"
+
     # Configure settings based on offline/online mode
     if offline:
         init_kwargs["settings"] = wandb.Settings(mode="offline")

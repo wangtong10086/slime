@@ -1,3 +1,5 @@
+import os
+
 import ray
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
@@ -50,7 +52,16 @@ def train(args):
             else:
                 actor_model.clear_memory()
 
+    skip_save = os.getenv("LIVEWEB_SKIP_SAVE", "0") == "1"
+
     def save(rollout_id):
+        if skip_save:
+            if getattr(args, "rank", 0) == 0:
+                print(
+                    f"[train] skipping checkpoint save at rollout_id={rollout_id} because LIVEWEB_SKIP_SAVE=1",
+                    flush=True,
+                )
+            return
         if (not args.use_critic) or (rollout_id >= args.num_critic_only_steps and not args.critic_train_only):
             actor_model.save_model(
                 rollout_id,

@@ -1,6 +1,7 @@
 import gc
 import os
 import shutil
+import sys
 
 import torch
 import torch.distributed as dist
@@ -43,6 +44,11 @@ def get_args():
     args.micro_batch_size = 1
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     args.global_batch_size = int(os.environ.get("WORLD_SIZE", "1"))
+    # This converter only needs a release checkpoint for model initialization.
+    # Skip optimizer/RNG state to reduce IO and avoid writing unnecessary shards.
+    args.use_distributed_optimizer = False
+    args.no_save_optim = True
+    args.no_save_rng = True
 
     assert world_size <= args.num_layers, (
         f"World size {world_size} must be less than or equal to number of layers {args.num_layers}. "
@@ -52,7 +58,9 @@ def get_args():
     def ceildiv(a, b):
         return -(a // -b)
 
-    if args.pipeline_model_parallel_size == 1 and world_size > 1:
+    user_set_pipeline_parallel = "--pipeline-model-parallel-size" in sys.argv
+
+    if not user_set_pipeline_parallel and args.pipeline_model_parallel_size == 1 and world_size > 1:
         pp_size = world_size
         while True:
             args.pipeline_model_parallel_size = pp_size
@@ -115,7 +123,14 @@ def main():
 
     # Load model
     hf_model_path = args.hf_checkpoint
-    bridge = AutoBridge.from_pretrained(hf_model_path, trust_remote_code=True)
+    bridge = AutoBridge.from_pretrained(
+        hf_model_path,
+        trust_remote_code=True,
+        make_vocab_size_divisible_by=args.make_vocab_size_divisible_by,
+    )
+    bridge.make_vocab_size_divisible_by = args.make_vocab_size_divisible_by
+    bridge.vocab_size = args.vocab_size
+    bridge.padded_vocab_size = args.padded_vocab_size
     bridge.load_weights(model, hf_model_path, memory_efficient=True)
     print(f"Model loaded: {hf_model_path}")
 

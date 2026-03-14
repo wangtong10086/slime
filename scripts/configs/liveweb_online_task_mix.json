@@ -1,0 +1,23 @@
+{
+  "stable_plugins": [
+    "hackernews"
+  ],
+  "full_plugins": [
+    "openlibrary",
+    "hackernews",
+    "coingecko",
+    "stooq",
+    "taostats",
+    "hybrid"
+  ],
+  "phases": {
+    "warmup": {
+      "stable_weight": 1.0,
+      "full_weight": 0.0
+    },
+    "main": {
+      "stable_weight": 0.35,
+      "full_weight": 0.65
+    }
+  }
+}

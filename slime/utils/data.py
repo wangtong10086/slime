@@ -82,11 +82,36 @@ def filter_long_prompt(origin_samples: list[Sample], tokenizer, processor, max_l
     if max_length is None:
         return origin_samples
 
-    if not isinstance(origin_samples[0].prompt, str):
-        logger.warning(
-            "Skipping max_length check for list prompt. Set apply_chat_template=True to enable length filtering."
+    if isinstance(origin_samples[0].prompt, list):
+        filtered_samples = []
+        skipped_samples = 0
+
+        for sample in origin_samples:
+            try:
+                tools = sample.metadata.get("tools") if sample.metadata is not None else None
+                input_ids = tokenizer.apply_chat_template(
+                    sample.prompt,
+                    tools=tools,
+                    tokenize=True,
+                    add_generation_prompt=False,
+                )
+            except Exception:
+                skipped_samples += 1
+                logger.warning("Failed to apply chat template for length filtering; keep sample unchanged.", exc_info=True)
+                filtered_samples.append(sample)
+                continue
+
+            if len(input_ids) <= max_length:
+                filtered_samples.append(sample)
+
+        logger.info(
+            "Filtered %s samples longer than max_length=%s for conversation prompts. "
+            "Skipped filtering on %s samples due to chat template errors.",
+            len(origin_samples) - len(filtered_samples),
+            max_length,
+            skipped_samples,
         )
-        return origin_samples
+        return filtered_samples
 
     if processor:
         # Use processor only for samples with actual multimodal content; use batched tokenizer for text-only.

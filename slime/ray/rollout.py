@@ -571,7 +571,11 @@ class RolloutManager:
 
             if not self.args.disable_rollout_trim_samples and not self.args.debug_rollout_only:
                 global_batch_size = self.args.global_batch_size
-                if self.args.use_dynamic_global_batch_size:
+                use_dynamic_global_batch_size = bool(
+                    getattr(self.args, "use_dynamic_global_batch_size", False)
+                    or getattr(self.args, "use_dynamic_batch_size", False)
+                )
+                if use_dynamic_global_batch_size:
                     logger.info(f"Collected {len(data)} samples from rollout to train with dynamic global batch size")
                     # TODO: this is a temporary solution, we should directly save dynamic_global_batch_size to rollout data
                     self._dynamic_global_batch_size = self._compute_dynamic_global_batch_size(len(data))

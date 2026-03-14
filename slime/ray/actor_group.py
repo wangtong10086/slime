@@ -114,7 +114,13 @@ class RayTrainGroup:
 
     def save_model(self, rollout_id, force_sync=False):
         """Save actor model"""
-        return ray.get([actor.save_model.remote(rollout_id, force_sync=force_sync) for actor in self._actor_handlers])
+        batch_size = max(1, int(os.environ.get("TRAIN_SAVE_BATCH_SIZE", "1")))
+        results = []
+        for start in range(0, len(self._actor_handlers), batch_size):
+            chunk = self._actor_handlers[start : start + batch_size]
+            refs = [actor.save_model.remote(rollout_id, force_sync=force_sync) for actor in chunk]
+            results.extend(ray.get(refs))
+        return results
 
     def update_weights(self):
         """Broadcast weights from rank 0 to all other ranks."""

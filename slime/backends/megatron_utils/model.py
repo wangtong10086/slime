@@ -1,5 +1,6 @@
 import dataclasses
 import gc
+import math
 import logging
 import math
 import os
@@ -644,8 +645,23 @@ def train(
             if args.enable_mtp_training:
                 log_dict[f"train/{role_tag}mtp_loss"] = mtp_losses
 
+            primary_lr = None
             for param_group_id, param_group in enumerate(optimizer.param_groups):
-                log_dict[f"train/{role_tag}lr-pg_{param_group_id}"] = opt_param_scheduler.get_lr(param_group)
+                lr = opt_param_scheduler.get_lr(param_group)
+                log_dict[f"train/{role_tag}lr-pg_{param_group_id}"] = lr
+                if primary_lr is None:
+                    primary_lr = lr
+
+            if primary_lr is not None:
+                log_dict[f"train/{role_tag}learning_rate"] = primary_lr
+
+            if args.loss_type == "sft_loss":
+                loss_key = f"train/{role_tag}loss"
+                if loss_key in log_dict:
+                    loss_value = log_dict[loss_key]
+                    log_dict[f"train/{role_tag}sft_loss"] = loss_value
+                    if math.isfinite(loss_value):
+                        log_dict[f"train/{role_tag}perplexity"] = math.exp(min(loss_value, 20.0))
 
             log_dict["train/step"] = accumulated_step_id
             logging_utils.log(args, log_dict, step_key="train/step")

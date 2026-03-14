@@ -5,6 +5,7 @@ import multiprocessing
 import os
 import time
 from urllib.parse import quote
+from urllib.parse import urlparse
 
 import requests
 import sglang_router
@@ -17,6 +18,33 @@ from slime.ray.ray_actor import RayActor
 from slime.utils.http_utils import get_host_info
 
 logger = logging.getLogger(__name__)
+
+
+def _should_bypass_proxy(base_url: str) -> bool:
+    try:
+        hostname = urlparse(base_url).hostname
+        if not hostname:
+            return False
+        if hostname in {"127.0.0.1", "localhost"}:
+            return True
+        ip = ipaddress.ip_address(hostname)
+        return ip.is_loopback or ip.is_private or ip.is_link_local
+    except ValueError:
+        return False
+
+
+def _build_requests_session(base_url: str) -> requests.Session:
+    session = requests.Session()
+    if _should_bypass_proxy(base_url):
+        session.trust_env = False
+    return session
+
+
+def _build_headers(api_key: str | None) -> dict[str, str]:
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
 
 
 def get_base_gpu_id(args, rank):
@@ -71,12 +99,9 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
 
 
 def _wait_server_healthy(base_url, api_key, is_process_alive):
-    headers = {
-        "Content-Type": "application/json; charset=utf-8",
-        "Authorization": f"Bearer {api_key}",
-    }
+    headers = _build_headers(api_key)
 
-    with requests.Session() as session:
+    with _build_requests_session(base_url) as session:
         while True:
             try:
                 response = session.get(f"{base_url}/health_generate", headers=headers)
@@ -154,6 +179,7 @@ class SGLangEngine(RayActor):
         self.node_rank = server_args_dict["node_rank"]
         self.server_host = server_args_dict["host"]  # with [] if ipv6
         self.server_port = server_args_dict["port"]
+        self.server_api_key = server_args_dict.get("api_key")
 
         if self.args.rollout_external:
             self._init_external(server_args_dict, external_engine_need_check_fields=external_engine_need_check_fields)
@@ -223,7 +249,8 @@ class SGLangEngine(RayActor):
             return
 
         url = f"http://{self.server_host}:{self.server_port}/{endpoint}"
-        response = requests.post(url, json=payload or {})
+        with _build_requests_session(url) as session:
+            response = session.post(url, json=payload or {}, headers=_build_headers(self.server_api_key))
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
@@ -246,10 +273,13 @@ class SGLangEngine(RayActor):
         if self.node_rank != 0:
             return True
 
-        response = requests.get(
-            f"http://{self.server_host}:{self.server_port}/health_generate",
-            timeout=timeout,
-        )
+        url = f"http://{self.server_host}:{self.server_port}/health_generate"
+        with _build_requests_session(url) as session:
+            response = session.get(
+                url,
+                timeout=timeout,
+                headers=_build_headers(self.server_api_key),
+            )
         response.raise_for_status()
         return True
 
@@ -283,9 +313,12 @@ class SGLangEngine(RayActor):
         if self.node_rank != 0:
             return
         # flush cache will not return status_code 200 when there are pending requests
+        url = f"http://{self.server_host}:{self.server_port}/flush_cache"
+        headers = _build_headers(self.server_api_key)
         for _ in range(60):
             try:
-                response = requests.get(f"http://{self.server_host}:{self.server_port}/flush_cache")
+                with _build_requests_session(url) as session:
+                    response = session.get(url, headers=headers)
                 if response.status_code == 200:
                     break
             except NewConnectionError as e:
@@ -335,7 +368,8 @@ class SGLangEngine(RayActor):
         if self.node_rank != 0:
             return
         url = f"http://{self.server_host}:{self.server_port}/get_weight_version"
-        response = requests.get(url)
+        with _build_requests_session(url) as session:
+            response = session.get(url, headers=_build_headers(self.server_api_key))
         response.raise_for_status()
         return response.json()["weight_version"]
 
@@ -409,12 +443,16 @@ class SGLangEngine(RayActor):
         )
 
     def pause_generation(self):
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/pause_generation", json={})
+        url = f"http://{self.server_host}:{self.server_port}/pause_generation"
+        with _build_requests_session(url) as session:
+            response = session.post(url, json={}, headers=_build_headers(self.server_api_key))
         response.raise_for_status()
         return response
 
     def continue_generation(self):
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/continue_generation", json={})
+        url = f"http://{self.server_host}:{self.server_port}/continue_generation"
+        with _build_requests_session(url) as session:
+            response = session.post(url, json={}, headers=_build_headers(self.server_api_key))
         response.raise_for_status()
         return response
 
@@ -451,23 +489,32 @@ class SGLangEngine(RayActor):
         with_stack: bool | None = None,
         record_shapes: bool | None = None,
     ):
-        response = requests.post(
-            f"http://{self.server_host}:{self.server_port}/start_profile",
-            json={
-                "output_dir": output_dir,
-                "start_step": start_step,
-                "num_steps": num_steps,
-                "activities": activities,
-                "profile_by_stage": profile_by_stage,
-                "with_stack": with_stack,
-                "record_shapes": record_shapes,
-            },
-        )
+        url = f"http://{self.server_host}:{self.server_port}/start_profile"
+        with _build_requests_session(url) as session:
+            response = session.post(
+                url,
+                json={
+                    "output_dir": output_dir,
+                    "start_step": start_step,
+                    "num_steps": num_steps,
+                    "activities": activities,
+                    "profile_by_stage": profile_by_stage,
+                    "with_stack": with_stack,
+                    "record_shapes": record_shapes,
+                },
+                headers=_build_headers(self.server_api_key),
+            )
         response.raise_for_status()
         return response
 
     def stop_profile(self):
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/stop_profile", json={})
+        url = f"http://{self.server_host}:{self.server_port}/stop_profile"
+        with _build_requests_session(url) as session:
+            response = session.post(
+                url,
+                json={},
+                headers=_build_headers(self.server_api_key),
+            )
         response.raise_for_status()
         return response
 

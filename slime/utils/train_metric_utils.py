@@ -46,3 +46,19 @@ def log_perf_data_raw(
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
     logging_utils.log(args, log_dict, step_key="rollout/step")
+
+    if args.loss_type == "sft_loss":
+        sft_log_dict = {"train/step": step}
+
+        alias_map = {
+            "perf/actor_train_tok_per_s": "train/tokens_per_s",
+            "perf/actor_train_tflops": "train/tflops",
+            "perf/actor_train_time": "train/compute_time",
+            "perf/step_time": "train/step_time",
+            "perf/wait_time_ratio": "train/data_wait_ratio",
+        }
+        for src_key, dst_key in alias_map.items():
+            if src_key in log_dict:
+                sft_log_dict[dst_key] = log_dict[src_key]
+
+        logging_utils.log(args, sft_log_dict, step_key="train/step")
