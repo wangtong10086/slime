@@ -15,7 +15,6 @@ from urllib.parse import urlparse
 
 import requests
 
-from slime.utils.misc import SingletonMeta
 from slime.utils.processing_utils import load_tokenizer
 from slime.utils.types import Sample
 
@@ -23,6 +22,18 @@ from slime.utils.types import Sample
 DEFAULT_TASK_MIX_PATH = Path("/home/xmyf/slime/scripts/configs/liveweb_online_task_mix.json")
 DEFAULT_LIVEWEB_ARENA_DIR = Path("/home/xmyf/liveweb-arena")
 ENV_POLLUTION_FAILURES = {"site_unreachable", "cache_error", "llm_error", "rollout_exception"}
+DEFAULT_PREWARM_URLS = {
+    "hackernews": [
+        "https://news.ycombinator.com/",
+        "https://news.ycombinator.com/ask",
+        "https://news.ycombinator.com/show",
+        "https://news.ycombinator.com/jobs",
+        "https://news.ycombinator.com/newest",
+    ],
+    "channelsurfer": [
+        "https://channelsurfer.tv/",
+    ],
+}
 
 
 def ensure_liveweb_import_path() -> Path:
@@ -89,9 +100,16 @@ def derive_llm_seed(task_seed: int, sample_index: int) -> int:
     return abs(hash((task_seed, sample_index, "liveweb_online_rl"))) % (2**31 - 1)
 
 
-def derive_route_key(prefix: str, parent_seed: int, subtask_index: int, sample_index: int | None = None) -> str:
+def derive_route_key(
+    prefix: str,
+    parent_seed: int,
+    subtask_index: int,
+    sample_index: int | None = None,
+    *,
+    include_sample_index: bool = True,
+) -> str:
     key = f"{prefix}:seed:{parent_seed}:subtask:{subtask_index}"
-    if sample_index is not None:
+    if include_sample_index and sample_index is not None:
         key += f":sample:{sample_index}"
     return key
 
@@ -145,7 +163,13 @@ def build_prompt_job(
         task_name=f"liveweb_arena:{plugin_name}",
         plugin_name=plugin_name,
         phase=phase,
-        route_key=derive_route_key(f"{phase}:prompt", parent_seed, subtask_index, sample_index),
+        route_key=derive_route_key(
+            f"{phase}:prompt",
+            parent_seed,
+            subtask_index,
+            sample_index,
+            include_sample_index=False,
+        ),
     )
 
 
@@ -440,13 +464,14 @@ def import_liveweb_env_symbols():
     return Actor, _handle_navigation_event, _handle_observation_event
 
 
-class LiveWebRolloutState(metaclass=SingletonMeta):
-    def __init__(self, args):
+class LiveWebRolloutState:
+    def __init__(self, args, *, scope: str = "train_rollout"):
         ensure_liveweb_import_path()
         from liveweb_arena.utils.llm_client import LLMServerConfig, MultiServerLLMRouter
         Actor, _, _ = import_liveweb_env_symbols()
 
         self.args = args
+        self.scope = scope
         self.tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
         self.api_key = os.getenv("LIVEWEB_API_KEY", os.getenv("API_KEY", os.getenv("SGLANG_API_KEY", "local-liveweb")))
         self.liveweb_cache_dir = Path(os.getenv("LIVEWEB_CACHE_DIR", "/data/liveweb_cache/persistent")).resolve()
@@ -484,12 +509,22 @@ class LiveWebRolloutState(metaclass=SingletonMeta):
         self.browser_rebuild_count = 0
         self.browser_reuse_failures = 0
         self.browser_recovery_success_count = 0
+        self.runtime_reset_count = 0
+        self.runtime_pool_hits = 0
+        self.runtime_jobs_since_reset = 0
+        self._force_refresh_next = False
+        self._consecutive_soft_failures = 0
+        self._max_reuse_jobs = read_int_env("LIVEWEB_RUNTIME_MAX_REUSE_JOBS", 24)
+        self._soft_failure_reset_threshold = read_int_env("LIVEWEB_RUNTIME_SOFT_FAILURE_RESET_THRESHOLD", 3)
+        self._prewarmed_urls: set[str] = set()
 
     def snapshot_browser_metrics(self) -> dict[str, int]:
         return {
             "browser_rebuild_count": self.browser_rebuild_count,
             "browser_reuse_failures": self.browser_reuse_failures,
             "browser_recovery_success_count": self.browser_recovery_success_count,
+            "runtime_reset_count": self.runtime_reset_count,
+            "runtime_pool_hits": self.runtime_pool_hits,
         }
 
     async def ensure_browser_ready(self) -> None:
@@ -504,20 +539,86 @@ class LiveWebRolloutState(metaclass=SingletonMeta):
                 except Exception:
                     pass
             self.browser_rebuild_count += 1
+            self.runtime_reset_count += 1
             await self.actor.shutdown()
             await self.actor._ensure_browser()
             self.browser_recovery_success_count += 1
+            self.runtime_jobs_since_reset = 0
+            self._consecutive_soft_failures = 0
+            self._force_refresh_next = False
+            self._prewarmed_urls.clear()
+
+    async def _prewarm_scope(self) -> None:
+        if not getattr(self.actor, "cache_manager", None):
+            return
+        try:
+            from liveweb_arena.core.cache import PageRequirement
+            from liveweb_arena.env import _find_plugin_for_url
+        except Exception:
+            return
+
+        prewarm_urls = []
+        env_urls = [
+            item.strip()
+            for item in os.getenv("LIVEWEB_PREWARM_URLS", "").split(",")
+            if item.strip()
+        ]
+        prewarm_urls.extend(env_urls)
+        for urls in DEFAULT_PREWARM_URLS.values():
+            prewarm_urls.extend(urls)
+        unique_urls = [url for url in dict.fromkeys(prewarm_urls) if url not in self._prewarmed_urls]
+        if not unique_urls:
+            return
+
+        plugins_used = {}
+        for plugin_name in stable_plugin_allowlist():
+            plugin = self.actor.task_manager.get_plugin(plugin_name)
+            if plugin is not None:
+                plugins_used[plugin_name] = plugin
+
+        for url in unique_urls:
+            plugin = _find_plugin_for_url(plugins_used, url)
+            if plugin is None:
+                continue
+            try:
+                need_api = plugin.needs_api_data(url)
+                page_req = PageRequirement.data(url) if need_api else PageRequirement.nav(url)
+                await self.actor.cache_manager.ensure_cached([page_req], plugin)
+                self._prewarmed_urls.add(url)
+            except Exception:
+                continue
+
+    def record_job_outcome(self, result: dict[str, Any]) -> None:
+        extra = result.get("extra") or {}
+        failure_reason = extra.get("failure_reason")
+        environment_failure = failure_reason in {"site_unreachable", "cache_error", "llm_error", "rollout_exception"}
+        if failure_reason == "rollout_exception" and extra.get("browser_transport_closed"):
+            self._force_refresh_next = True
+        if environment_failure:
+            self._consecutive_soft_failures += 1
+        else:
+            self._consecutive_soft_failures = 0
+        self.runtime_jobs_since_reset += 1
 
     async def prepare_for_eval(self) -> None:
         self._rollout_phase = "eval"
-        await self.ensure_browser_ready()
+        await self.recover_browser(force_refresh=True)
+        await self._prewarm_scope()
 
     async def prepare_for_train_rollout(self) -> None:
-        if self._rollout_phase != "train":
+        needs_refresh = (
+            self._rollout_phase != "train"
+            or self._force_refresh_next
+            or self.runtime_jobs_since_reset >= self._max_reuse_jobs
+            or self._consecutive_soft_failures >= self._soft_failure_reset_threshold
+        )
+        if needs_refresh:
             await self.recover_browser(force_refresh=True)
             self._rollout_phase = "train"
+            await self._prewarm_scope()
             return
         await self.ensure_browser_ready()
+        self.runtime_pool_hits += 1
 
 
 def _should_bypass_proxy(base_url: str) -> bool:
@@ -834,9 +935,4 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
 
 
 async def shutdown_liveweb_state():
-    state = LiveWebRolloutState._instances.get(LiveWebRolloutState)  # type: ignore[attr-defined]
-    if state is not None:
-        try:
-            await state.actor.shutdown()
-        finally:
-            LiveWebRolloutState.clear_instances()
+    return None

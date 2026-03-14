@@ -31,6 +31,10 @@ class SingletonMeta(type):
         return cls._instances[cls]
 
     def clear_instances(cls):
+        for instance in cls._instances.values():
+            close = getattr(instance, "close", None)
+            if callable(close):
+                close()
         cls._instances = {}
 
 

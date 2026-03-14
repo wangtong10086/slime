@@ -27,6 +27,10 @@ RAY_HEAD_PORT="${RAY_HEAD_PORT:-6390}"
 RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8270}"
 RAY_JOB_PORT="${RAY_JOB_PORT:-${RAY_DASHBOARD_PORT}}"
 RAY_TMPDIR="${RAY_TMPDIR:-/data/ray/liveweb_online_rl}"
+NUM_ROLLOUT_GPUS="${NUM_ROLLOUT_GPUS:-8}"
+ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}"
+SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.88}"
+SGLANG_CONTEXT_LENGTH="${SGLANG_CONTEXT_LENGTH:-32768}"
 
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-4}"
@@ -73,6 +77,19 @@ fi
 
 mkdir -p "${RUN_ROOT}" "${RUN_CHECKPOINT_DIR}" "${LIVEWEB_CACHE_DIR}" "${LIVEWEB_SERVICE_ROOT}" "${RAY_TMPDIR}"
 
+if (( NUM_ROLLOUT_GPUS % ROLLOUT_NUM_GPUS_PER_ENGINE != 0 )); then
+  echo "NUM_ROLLOUT_GPUS (${NUM_ROLLOUT_GPUS}) must be divisible by ROLLOUT_NUM_GPUS_PER_ENGINE (${ROLLOUT_NUM_GPUS_PER_ENGINE})" >&2
+  exit 1
+fi
+ROLLOUT_NUM_ENGINES=$((NUM_ROLLOUT_GPUS / ROLLOUT_NUM_GPUS_PER_ENGINE))
+DEFAULT_WORKER_PORTS="$(ROLLOUT_NUM_ENGINES="${ROLLOUT_NUM_ENGINES}" python3 - <<'PY'
+import os
+num_engines = int(os.environ["ROLLOUT_NUM_ENGINES"])
+base_port = 15000
+print(",".join(str(base_port + 2 * idx) for idx in range(num_engines)))
+PY
+)"
+
 export PATH="${CUDA_HOME}/bin:${PATH}"
 export PYTHONBUFFERED=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -81,6 +98,8 @@ export no_proxy="${NO_PROXY}"
 export SLIME_DIR SLIME_VENV MEGATRON_LM_PATH CUDA_HOME LIVEWEB_ARENA_DIR HF_MODEL_DIR REF_LOAD_DIR
 export RUN_ROOT RUN_CHECKPOINT_DIR LIVEWEB_CACHE_DIR LIVEWEB_SERVICE_ROOT
 export LIVEWEB_TASK_MIX_PHASE="${TASK_MIX_PHASE}"
+export SLIME_ENVIRONMENT_NAME="${SLIME_ENVIRONMENT_NAME:-liveweb}"
+export SLIME_ENV_ADAPTER_PATH="${SLIME_ENV_ADAPTER_PATH:-slime.env_adapters.liveweb.LiveWebEnvironmentAdapter}"
 export TASK_REGISTRY_VERSION="${TASK_REGISTRY_VERSION:-v2}"
 export LIVEWEB_ENABLE_THINKING=0
 export LIVEWEB_SEPARATE_REASONING=1
@@ -90,8 +109,24 @@ export LIVEWEB_TIMEOUT_SECONDS="${LIVEWEB_TIMEOUT_SECONDS:-1800}"
 export LIVEWEB_MAX_BROWSER_SESSIONS="${LIVEWEB_MAX_BROWSER_SESSIONS:-32}"
 export LIVEWEB_MAX_LLM_REQUESTS="${LIVEWEB_MAX_LLM_REQUESTS:-16}"
 export LIVEWEB_PARALLEL_GROUPS="${LIVEWEB_PARALLEL_GROUPS:-8}"
+export SLIME_ENV_TARGET_ACTIVE_JOBS="${SLIME_ENV_TARGET_ACTIVE_JOBS:-64}"
+export SLIME_ENV_TARGET_READY_GROUPS="${SLIME_ENV_TARGET_READY_GROUPS:-8}"
+export SLIME_ENV_MAX_PARALLEL_ENV_JOBS="${SLIME_ENV_MAX_PARALLEL_ENV_JOBS:-32}"
+export SLIME_ENV_MAX_PARALLEL_LLM_JOBS="${SLIME_ENV_MAX_PARALLEL_LLM_JOBS:-16}"
+export SLIME_ENV_OVERSAMPLE_FACTOR="${SLIME_ENV_OVERSAMPLE_FACTOR:-2.0}"
 export LIVEWEB_ROUTE_POLICY="${LIVEWEB_ROUTE_POLICY:-sticky_steal}"
+export LIVEWEB_RUNTIME_MAX_REUSE_JOBS="${LIVEWEB_RUNTIME_MAX_REUSE_JOBS:-24}"
+export LIVEWEB_RUNTIME_SOFT_FAILURE_RESET_THRESHOLD="${LIVEWEB_RUNTIME_SOFT_FAILURE_RESET_THRESHOLD:-3}"
+export LIVEWEB_SOFT_FAIL_DOMAINS="${LIVEWEB_SOFT_FAIL_DOMAINS:-news.ycombinator.com,channelsurfer.tv}"
+export LIVEWEB_SOFT_FAIL_URL_PATTERNS="${LIVEWEB_SOFT_FAIL_URL_PATTERNS:-news.ycombinator.com/ask,news.ycombinator.com/show,channelsurfer.tv,runcaptain.com,aether.saphal.me}"
+export LIVEWEB_PREWARM_URLS="${LIVEWEB_PREWARM_URLS:-https://news.ycombinator.com/,https://news.ycombinator.com/ask,https://news.ycombinator.com/show}"
+export LIVEWEB_REQUIRED_SOFT_URL_REGEXES="${LIVEWEB_REQUIRED_SOFT_URL_REGEXES:-^news\\.ycombinator\\.com/?$,^news\\.ycombinator\\.com/(ask|show|jobs|newest)(?:[/?].*)?$}"
+export LIVEWEB_PREFETCH_SOFT_URL_REGEXES="${LIVEWEB_PREFETCH_SOFT_URL_REGEXES:-^channelsurfer\\.tv(?:/.*)?$,^runcaptain\\.com(?:/.*)?$,^aether\\.saphal\\.me(?:/.*)?$}"
+export LIVEWEB_RUNTIME_JIT_KERNEL_ENABLED="${LIVEWEB_RUNTIME_JIT_KERNEL_ENABLED:-1}"
+export LIVEWEB_RUNTIME_KERNEL_FALLBACK="${LIVEWEB_RUNTIME_KERNEL_FALLBACK:-0}"
+export LIVEWEB_RUNTIME_KERNEL_FALLBACK_REASON="${LIVEWEB_RUNTIME_KERNEL_FALLBACK_REASON:-unknown}"
 export LIVEWEB_TASK_MIX_CONFIG="${LIVEWEB_TASK_MIX_CONFIG:-${SLIME_DIR}/scripts/configs/liveweb_online_task_mix.json}"
+export SLIME_DUMP_ROLLOUT_TRAJECTORIES="${SLIME_DUMP_ROLLOUT_TRAJECTORIES:-0}"
 export LIVEWEB_ALLOW_ZERO_STD_FALLBACK="${LIVEWEB_ALLOW_ZERO_STD_FALLBACK:-1}"
 if [[ "${TRAIN_PHASE}" == "main" ]]; then
   DEFAULT_MIN_GROUP_SIZE=2
@@ -113,10 +148,12 @@ export LIVEWEB_API_KEY="${LIVEWEB_API_KEY:-local-liveweb}"
 export LIVEWEB_QUICK_EVAL_PROMPTS="${LIVEWEB_QUICK_EVAL_PROMPTS:-32}"
 export LIVEWEB_FORMAL_EVAL_PROMPTS="${LIVEWEB_FORMAL_EVAL_PROMPTS:-200}"
 export LIVEWEB_FORMAL_EVAL_EVERY="${LIVEWEB_FORMAL_EVAL_EVERY:-50}"
-export LIVEWEB_SGLANG_WORKER_PORTS="${LIVEWEB_SGLANG_WORKER_PORTS:-15000,15002,15004,15006,15008,15010,15012,15014}"
+export LIVEWEB_SGLANG_WORKER_PORTS="${LIVEWEB_SGLANG_WORKER_PORTS:-${DEFAULT_WORKER_PORTS}}"
 export TRAIN_SAVE_BATCH_SIZE
 export TRAIN_UPDATE_WEIGHTS_BATCH_SIZE
 export RAY_MEMORY_USAGE_THRESHOLD
+export NUM_ROLLOUT_GPUS ROLLOUT_NUM_GPUS_PER_ENGINE ROLLOUT_NUM_ENGINES
+export SGLANG_MEM_FRACTION_STATIC SGLANG_CONTEXT_LENGTH
 
 NUM_ROLLOUT=1
 SAVE_INTERVAL=1
@@ -190,9 +227,11 @@ COMMON_ARGS=(
   --actor-num-nodes 1
   --actor-num-gpus-per-node 8
   --colocate
-  --rollout-num-gpus 8
-  --rollout-num-gpus-per-engine 1
+  --rollout-num-gpus "${NUM_ROLLOUT_GPUS}"
+  --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE}"
   --num-gpus-per-node 8
+  --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC}"
+  --sglang-context-length "${SGLANG_CONTEXT_LENGTH}"
 
   "${MODEL_ARGS[@]}"
   --hf-checkpoint "${HF_MODEL_DIR}"
@@ -201,11 +240,13 @@ COMMON_ARGS=(
   --save "${RUN_CHECKPOINT_DIR}"
   --save-interval "${SAVE_INTERVAL}"
 
-  --data-source-path slime.rollout.liveweb_online.data_source.LiveWebOnlineDataSource
-  --rollout-function-path slime.rollout.liveweb_online.rollout.generate_rollout
-  --eval-function-path slime.rollout.liveweb_online.rollout.generate_rollout
-  --custom-rm-path slime.rollout.liveweb_online.reward.reward_func
-  --custom-reward-post-process-path slime.rollout.liveweb_online.reward.post_process_rewards
+  --data-source-path slime.rollout.env_adapter.data_source.AdapterDataSource
+  --rollout-function-path slime.rollout.env_adapter.rollout.generate_rollout
+  --eval-function-path slime.rollout.env_adapter.rollout.generate_rollout
+  --custom-rm-path slime.rollout.env_adapter.reward.reward_func
+  --custom-reward-post-process-path slime.rollout.env_adapter.reward.post_process_rewards
+  --environment-name "${SLIME_ENVIRONMENT_NAME}"
+  --environment-adapter-path "${SLIME_ENV_ADAPTER_PATH}"
 
   --advantage-estimator grpo
   --use-kl-loss
@@ -251,7 +292,6 @@ COMMON_ARGS=(
   --sglang-api-key "${LIVEWEB_API_KEY}"
   --sglang-tool-call-parser qwen
   --sglang-reasoning-parser qwen3
-  --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC:-0.80}"
 
   --attention-dropout 0.0
   --hidden-dropout 0.0
@@ -291,11 +331,18 @@ cat > "${RUN_ROOT}/run_config.json" <<JSON
 {
   "train_phase": "${TRAIN_PHASE}",
   "task_mix_phase": "${TASK_MIX_PHASE}",
+  "environment_name": "${SLIME_ENVIRONMENT_NAME}",
+  "environment_adapter_path": "${SLIME_ENV_ADAPTER_PATH}",
+  "num_rollout_gpus": ${NUM_ROLLOUT_GPUS},
+  "rollout_num_gpus_per_engine": ${ROLLOUT_NUM_GPUS_PER_ENGINE},
+  "rollout_num_engines": ${ROLLOUT_NUM_ENGINES},
   "num_rollout": ${NUM_ROLLOUT},
   "rollout_batch_size": ${ROLLOUT_BATCH_SIZE},
   "n_samples_per_prompt": ${N_SAMPLES_PER_PROMPT},
   "global_batch_size": ${GLOBAL_BATCH_SIZE},
   "rollout_max_prompt_len": ${ROLLOUT_MAX_PROMPT_LEN},
+  "sglang_context_length": ${SGLANG_CONTEXT_LENGTH},
+  "sglang_mem_fraction_static": ${SGLANG_MEM_FRACTION_STATIC},
   "liveweb_max_completion_tokens": ${LIVEWEB_MAX_COMPLETION_TOKENS},
   "max_steps": ${MAX_STEPS},
   "skip_save": ${LIVEWEB_SKIP_SAVE},
@@ -303,6 +350,17 @@ cat > "${RUN_ROOT}/run_config.json" <<JSON
   "update_weights_batch_size": ${TRAIN_UPDATE_WEIGHTS_BATCH_SIZE},
   "ray_memory_usage_threshold": ${RAY_MEMORY_USAGE_THRESHOLD},
   "effective_save_interval": ${SAVE_INTERVAL},
+  "target_active_jobs": ${SLIME_ENV_TARGET_ACTIVE_JOBS},
+  "target_ready_groups": ${SLIME_ENV_TARGET_READY_GROUPS},
+  "max_parallel_env_jobs": ${SLIME_ENV_MAX_PARALLEL_ENV_JOBS},
+  "max_parallel_llm_jobs": ${SLIME_ENV_MAX_PARALLEL_LLM_JOBS},
+  "runtime_jit_kernel_enabled": ${LIVEWEB_RUNTIME_JIT_KERNEL_ENABLED},
+  "runtime_kernel_fallback": ${LIVEWEB_RUNTIME_KERNEL_FALLBACK},
+  "runtime_kernel_fallback_reason": "${LIVEWEB_RUNTIME_KERNEL_FALLBACK_REASON}",
+  "oversample_factor": ${SLIME_ENV_OVERSAMPLE_FACTOR},
+  "dump_rollout_trajectories": ${SLIME_DUMP_ROLLOUT_TRAJECTORIES},
+  "runtime_max_reuse_jobs": ${LIVEWEB_RUNTIME_MAX_REUSE_JOBS},
+  "runtime_soft_failure_reset_threshold": ${LIVEWEB_RUNTIME_SOFT_FAILURE_RESET_THRESHOLD},
   "hf_model_dir": "${HF_MODEL_DIR}",
   "ref_load_dir": "${REF_LOAD_DIR}",
   "liveweb_arena_dir": "${LIVEWEB_ARENA_DIR}",
@@ -346,7 +404,17 @@ env_vars = {
     "LIVEWEB_MAX_BROWSER_SESSIONS": os.environ["LIVEWEB_MAX_BROWSER_SESSIONS"],
     "LIVEWEB_MAX_LLM_REQUESTS": os.environ["LIVEWEB_MAX_LLM_REQUESTS"],
     "LIVEWEB_PARALLEL_GROUPS": os.environ["LIVEWEB_PARALLEL_GROUPS"],
+    "SLIME_ENV_TARGET_ACTIVE_JOBS": os.environ["SLIME_ENV_TARGET_ACTIVE_JOBS"],
+    "SLIME_ENV_TARGET_READY_GROUPS": os.environ["SLIME_ENV_TARGET_READY_GROUPS"],
+    "SLIME_ENV_MAX_PARALLEL_ENV_JOBS": os.environ["SLIME_ENV_MAX_PARALLEL_ENV_JOBS"],
+    "SLIME_ENV_MAX_PARALLEL_LLM_JOBS": os.environ["SLIME_ENV_MAX_PARALLEL_LLM_JOBS"],
+    "SLIME_ENV_OVERSAMPLE_FACTOR": os.environ["SLIME_ENV_OVERSAMPLE_FACTOR"],
     "LIVEWEB_ROUTE_POLICY": os.environ["LIVEWEB_ROUTE_POLICY"],
+    "LIVEWEB_RUNTIME_MAX_REUSE_JOBS": os.environ["LIVEWEB_RUNTIME_MAX_REUSE_JOBS"],
+    "LIVEWEB_RUNTIME_SOFT_FAILURE_RESET_THRESHOLD": os.environ["LIVEWEB_RUNTIME_SOFT_FAILURE_RESET_THRESHOLD"],
+    "LIVEWEB_SOFT_FAIL_DOMAINS": os.environ["LIVEWEB_SOFT_FAIL_DOMAINS"],
+    "LIVEWEB_SOFT_FAIL_URL_PATTERNS": os.environ["LIVEWEB_SOFT_FAIL_URL_PATTERNS"],
+    "LIVEWEB_PREWARM_URLS": os.environ["LIVEWEB_PREWARM_URLS"],
     "LIVEWEB_TASK_MIX_PHASE": os.environ["LIVEWEB_TASK_MIX_PHASE"],
     "LIVEWEB_TASK_MIX_CONFIG": os.environ["LIVEWEB_TASK_MIX_CONFIG"],
     "LIVEWEB_MIN_GROUP_SIZE": os.environ["LIVEWEB_MIN_GROUP_SIZE"],

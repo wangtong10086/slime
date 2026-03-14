@@ -532,6 +532,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="The data source class for rollout data.",
             )
             parser.add_argument(
+                "--environment-adapter-path",
+                type=str,
+                default=None,
+                help=(
+                    "Path to the environment adapter class used by generic environment rollouts. "
+                    "Example: slime.env_adapters.liveweb.LiveWebEnvironmentAdapter."
+                ),
+            )
+            parser.add_argument(
+                "--environment-name",
+                type=str,
+                default=None,
+                help=(
+                    "Environment adapter alias. Used by generic environment rollouts when "
+                    "--environment-adapter-path is not provided."
+                ),
+            )
+            parser.add_argument(
                 "--prompt-data",
                 type=str,
                 default=None,
