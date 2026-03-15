@@ -35,13 +35,18 @@ SGLANG_CONTEXT_LENGTH="${SGLANG_CONTEXT_LENGTH:-32768}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-4}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
+TRAIN_DYNAMIC_GLOBAL_BATCH_SIZE_CAP="${TRAIN_DYNAMIC_GLOBAL_BATCH_SIZE_CAP:-${GLOBAL_BATCH_SIZE}}"
+TRAIN_MIN_DYNAMIC_GLOBAL_BATCH_SIZE="${TRAIN_MIN_DYNAMIC_GLOBAL_BATCH_SIZE:-$(( GLOBAL_BATCH_SIZE / 2 ))}"
+TRAIN_MAX_SAMPLES_PER_ROLLOUT="${TRAIN_MAX_SAMPLES_PER_ROLLOUT:-0}"
 ROLLOUT_MAX_PROMPT_LEN="${ROLLOUT_MAX_PROMPT_LEN:-32768}"
 LIVEWEB_MAX_COMPLETION_TOKENS="${LIVEWEB_MAX_COMPLETION_TOKENS:-1024}"
 MAX_STEPS="${MAX_STEPS:-30}"
+RECOMPUTE_LOSS_FUNCTION="${RECOMPUTE_LOSS_FUNCTION:-1}"
+LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-1024}"
 
 LR="${LR:-5e-7}"
 MIN_LR="${MIN_LR:-5e-8}"
-MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-1536}"
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-1024}"
 SAVE_INTERVAL_OVERRIDE="${SAVE_INTERVAL_OVERRIDE:-}"
 EVAL_INTERVAL_OVERRIDE="${EVAL_INTERVAL_OVERRIDE:-}"
 NUM_ROLLOUT_OVERRIDE="${NUM_ROLLOUT_OVERRIDE:-}"
@@ -114,14 +119,17 @@ export SLIME_ENV_TARGET_READY_GROUPS="${SLIME_ENV_TARGET_READY_GROUPS:-8}"
 export SLIME_ENV_MAX_PARALLEL_ENV_JOBS="${SLIME_ENV_MAX_PARALLEL_ENV_JOBS:-32}"
 export SLIME_ENV_MAX_PARALLEL_LLM_JOBS="${SLIME_ENV_MAX_PARALLEL_LLM_JOBS:-16}"
 export SLIME_ENV_OVERSAMPLE_FACTOR="${SLIME_ENV_OVERSAMPLE_FACTOR:-2.0}"
+export TRAIN_DYNAMIC_GLOBAL_BATCH_SIZE_CAP
+export TRAIN_MIN_DYNAMIC_GLOBAL_BATCH_SIZE
+export TRAIN_MAX_SAMPLES_PER_ROLLOUT
 export LIVEWEB_ROUTE_POLICY="${LIVEWEB_ROUTE_POLICY:-sticky_steal}"
 export LIVEWEB_RUNTIME_MAX_REUSE_JOBS="${LIVEWEB_RUNTIME_MAX_REUSE_JOBS:-24}"
 export LIVEWEB_RUNTIME_SOFT_FAILURE_RESET_THRESHOLD="${LIVEWEB_RUNTIME_SOFT_FAILURE_RESET_THRESHOLD:-3}"
 export LIVEWEB_SOFT_FAIL_DOMAINS="${LIVEWEB_SOFT_FAIL_DOMAINS:-news.ycombinator.com,channelsurfer.tv}"
-export LIVEWEB_SOFT_FAIL_URL_PATTERNS="${LIVEWEB_SOFT_FAIL_URL_PATTERNS:-news.ycombinator.com/ask,news.ycombinator.com/show,channelsurfer.tv,runcaptain.com,aether.saphal.me}"
+export LIVEWEB_SOFT_FAIL_URL_PATTERNS="${LIVEWEB_SOFT_FAIL_URL_PATTERNS:-news.ycombinator.com/ask,news.ycombinator.com/show,channelsurfer.tv,runcaptain.com,aether.saphal.me,openlibrary.org/search,openlibrary.org/subjects,taostats.io}"
 export LIVEWEB_PREWARM_URLS="${LIVEWEB_PREWARM_URLS:-https://news.ycombinator.com/,https://news.ycombinator.com/ask,https://news.ycombinator.com/show}"
-export LIVEWEB_REQUIRED_SOFT_URL_REGEXES="${LIVEWEB_REQUIRED_SOFT_URL_REGEXES:-^news\\.ycombinator\\.com/?$,^news\\.ycombinator\\.com/(ask|show|jobs|newest)(?:[/?].*)?$}"
-export LIVEWEB_PREFETCH_SOFT_URL_REGEXES="${LIVEWEB_PREFETCH_SOFT_URL_REGEXES:-^channelsurfer\\.tv(?:/.*)?$,^runcaptain\\.com(?:/.*)?$,^aether\\.saphal\\.me(?:/.*)?$}"
+export LIVEWEB_REQUIRED_SOFT_URL_REGEXES="${LIVEWEB_REQUIRED_SOFT_URL_REGEXES:-^news\\.ycombinator\\.com/?$,^news\\.ycombinator\\.com/(ask|show|jobs|newest)(?:[/?].*)?$,^openlibrary\\.org/(search|subjects)(?:[/?].*)?$,^(?:www\\.)?taostats\\.io(?:/(subnets(?:/.*)?)?)?$}"
+export LIVEWEB_PREFETCH_SOFT_URL_REGEXES="${LIVEWEB_PREFETCH_SOFT_URL_REGEXES:-^channelsurfer\\.tv(?:/.*)?$,^runcaptain\\.com(?:/.*)?$,^aether\\.saphal\\.me(?:/.*)?$,^openlibrary\\.org/(search|subjects)(?:[/?].*)?$,^(?:www\\.)?taostats\\.io(?:/(subnets(?:/.*)?)?)?$}"
 export LIVEWEB_RUNTIME_JIT_KERNEL_ENABLED="${LIVEWEB_RUNTIME_JIT_KERNEL_ENABLED:-1}"
 export LIVEWEB_RUNTIME_KERNEL_FALLBACK="${LIVEWEB_RUNTIME_KERNEL_FALLBACK:-0}"
 export LIVEWEB_RUNTIME_KERNEL_FALLBACK_REASON="${LIVEWEB_RUNTIME_KERNEL_FALLBACK_REASON:-unknown}"
@@ -267,6 +275,8 @@ COMMON_ARGS=(
   --global-batch-size "${GLOBAL_BATCH_SIZE}"
   --use-dynamic-batch-size
   --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
+  --log-probs-chunk-size "${LOG_PROBS_CHUNK_SIZE}"
+  --train-env-vars '{"PYTORCH_ALLOC_CONF":"expandable_segments:True"}'
 
   --optimizer adam
   --lr "${LR}"
@@ -299,6 +309,10 @@ COMMON_ARGS=(
   --accumulate-allreduce-grads-in-fp32
   --attention-softmax-in-fp32
 )
+
+if [[ "${RECOMPUTE_LOSS_FUNCTION}" == "1" ]]; then
+  COMMON_ARGS+=(--recompute-loss-function)
+fi
 
 if [[ "${DEBUG_ROLLOUT_ONLY}" == "1" ]]; then
   COMMON_ARGS+=(--debug-rollout-only)
@@ -340,11 +354,17 @@ cat > "${RUN_ROOT}/run_config.json" <<JSON
   "rollout_batch_size": ${ROLLOUT_BATCH_SIZE},
   "n_samples_per_prompt": ${N_SAMPLES_PER_PROMPT},
   "global_batch_size": ${GLOBAL_BATCH_SIZE},
+  "dynamic_global_batch_size_cap": ${TRAIN_DYNAMIC_GLOBAL_BATCH_SIZE_CAP},
+  "min_dynamic_global_batch_size": ${TRAIN_MIN_DYNAMIC_GLOBAL_BATCH_SIZE},
+  "max_samples_per_rollout": ${TRAIN_MAX_SAMPLES_PER_ROLLOUT},
   "rollout_max_prompt_len": ${ROLLOUT_MAX_PROMPT_LEN},
   "sglang_context_length": ${SGLANG_CONTEXT_LENGTH},
   "sglang_mem_fraction_static": ${SGLANG_MEM_FRACTION_STATIC},
   "liveweb_max_completion_tokens": ${LIVEWEB_MAX_COMPLETION_TOKENS},
   "max_steps": ${MAX_STEPS},
+  "recompute_loss_function": ${RECOMPUTE_LOSS_FUNCTION},
+  "log_probs_chunk_size": ${LOG_PROBS_CHUNK_SIZE},
+  "max_tokens_per_gpu": ${MAX_TOKENS_PER_GPU},
   "skip_save": ${LIVEWEB_SKIP_SAVE},
   "save_batch_size": ${TRAIN_SAVE_BATCH_SIZE},
   "update_weights_batch_size": ${TRAIN_UPDATE_WEIGHTS_BATCH_SIZE},
@@ -409,6 +429,9 @@ env_vars = {
     "SLIME_ENV_MAX_PARALLEL_ENV_JOBS": os.environ["SLIME_ENV_MAX_PARALLEL_ENV_JOBS"],
     "SLIME_ENV_MAX_PARALLEL_LLM_JOBS": os.environ["SLIME_ENV_MAX_PARALLEL_LLM_JOBS"],
     "SLIME_ENV_OVERSAMPLE_FACTOR": os.environ["SLIME_ENV_OVERSAMPLE_FACTOR"],
+    "TRAIN_DYNAMIC_GLOBAL_BATCH_SIZE_CAP": os.environ["TRAIN_DYNAMIC_GLOBAL_BATCH_SIZE_CAP"],
+    "TRAIN_MIN_DYNAMIC_GLOBAL_BATCH_SIZE": os.environ["TRAIN_MIN_DYNAMIC_GLOBAL_BATCH_SIZE"],
+    "TRAIN_MAX_SAMPLES_PER_ROLLOUT": os.environ["TRAIN_MAX_SAMPLES_PER_ROLLOUT"],
     "LIVEWEB_ROUTE_POLICY": os.environ["LIVEWEB_ROUTE_POLICY"],
     "LIVEWEB_RUNTIME_MAX_REUSE_JOBS": os.environ["LIVEWEB_RUNTIME_MAX_REUSE_JOBS"],
     "LIVEWEB_RUNTIME_SOFT_FAILURE_RESET_THRESHOLD": os.environ["LIVEWEB_RUNTIME_SOFT_FAILURE_RESET_THRESHOLD"],

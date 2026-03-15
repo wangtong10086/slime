@@ -3,7 +3,6 @@
     "hackernews"
   ],
   "full_plugins": [
-    "openlibrary",
     "hackernews",
     "coingecko",
     "stooq",
