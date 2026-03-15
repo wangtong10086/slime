@@ -1,3 +1,4 @@
+import logging
 import os
 
 import ray
@@ -5,6 +6,8 @@ from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from slime.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
+
+logger = logging.getLogger(__name__)
 
 
 class RayTrainGroup:
@@ -114,13 +117,29 @@ class RayTrainGroup:
 
     def save_model(self, rollout_id, force_sync=False):
         """Save actor model"""
-        batch_size = max(1, int(os.environ.get("TRAIN_SAVE_BATCH_SIZE", "1")))
+        batch_size = self._resolve_save_batch_size()
         results = []
         for start in range(0, len(self._actor_handlers), batch_size):
             chunk = self._actor_handlers[start : start + batch_size]
             refs = [actor.save_model.remote(rollout_id, force_sync=force_sync) for actor in chunk]
             results.extend(ray.get(refs))
         return results
+
+    def _resolve_save_batch_size(self) -> int:
+        requested_batch_size = max(1, int(os.environ.get("TRAIN_SAVE_BATCH_SIZE", "1")))
+        world_size = len(self._actor_handlers)
+
+        if getattr(self.args, "train_backend", None) == "megatron":
+            if requested_batch_size != world_size:
+                logger.warning(
+                    "Megatron distributed checkpoint save requires all ranks to enter together; "
+                    "ignoring TRAIN_SAVE_BATCH_SIZE=%s and using world_size=%s instead.",
+                    requested_batch_size,
+                    world_size,
+                )
+            return world_size
+
+        return requested_batch_size
 
     def update_weights(self):
         """Broadcast weights from rank 0 to all other ranks."""
