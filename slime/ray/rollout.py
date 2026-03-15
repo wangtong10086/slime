@@ -28,11 +28,35 @@ from slime.utils.types import Sample
 
 from ..utils.metric_utils import has_repetition
 from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
+from .rollout_batching import choose_dynamic_global_batch_size, compute_train_trim_length, resolve_max_samples_per_rollout
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+def _rewrite_eval_aux_metrics(metrics: dict[str, Any] | None) -> dict[str, Any]:
+    """Route eval-only auxiliary metrics onto eval-specific namespaces."""
+    if not metrics:
+        return {}
+
+    prefix_map = {
+        "env/": "eval_env/",
+        "cache/": "eval_cache/",
+        "runtime/": "eval_runtime/",
+        "scheduler/": "eval_scheduler/",
+    }
+
+    rewritten: dict[str, Any] = {}
+    for key, value in metrics.items():
+        for old_prefix, new_prefix in prefix_map.items():
+            if key.startswith(old_prefix):
+                rewritten[f"{new_prefix}{key[len(old_prefix):]}"] = value
+                break
+        else:
+            rewritten[key] = value
+    return rewritten
 
 
 @dataclasses.dataclass
@@ -581,40 +605,60 @@ class RolloutManager:
                     self._dynamic_global_batch_size = self._compute_dynamic_global_batch_size(len(data))
                     global_batch_size = self._dynamic_global_batch_size
 
-                if len(data) % global_batch_size != 0:
-                    trim_len = (len(data) // global_batch_size) * global_batch_size
+                max_samples_per_rollout = resolve_max_samples_per_rollout(global_batch_size)
+                trim_len = compute_train_trim_length(len(data), global_batch_size, max_samples_per_rollout)
+                if trim_len != len(data):
                     if trim_len == 0:
                         raise ValueError(f"Not enough samples {len(data)} for global_batch_size {global_batch_size}")
                     origin_data_length = len(data)
                     data = data[:trim_len]
-                    logger.info(f"trim number of samples from {origin_data_length} to {trim_len}")
-                logger.info(f"Final collected {len(data)} samples from rollout to train")
+                    logger.info(
+                        f"trim number of samples from {origin_data_length} to {trim_len} "
+                        f"(global_batch_size={global_batch_size}, train_steps={trim_len // global_batch_size})"
+                    )
+                logger.info(
+                    f"Final collected {len(data)} samples from rollout to train "
+                    f"(global_batch_size={global_batch_size}, train_steps={len(data) // global_batch_size})"
+                )
 
         return data, metrics
 
     def _compute_dynamic_global_batch_size(self, num_samples: int) -> int:
-        """Calculate dynamic global_batch_size to ensure only one training step.
+        """Choose a train step size that fits dynamic batch constraints.
 
-        Strategy: global_batch_size = num_samples rounded down to a multiple of dp_size
-        This ensures num_steps_per_rollout = num_samples // global_batch_size = 1
+        The returned value is the per-step ``global_batch_size``. A rollout may
+        still contain multiple train steps when enough full samples remain after
+        trimming.
         """
         dp_size = self.train_parallel_config["dp_size"]
         original_gbs = self.args.global_batch_size
 
-        # Round down to a multiple of dp_size to ensure only one training step
-        dynamic_gbs = (num_samples // dp_size) * dp_size
+        configured_cap = int(os.environ.get("TRAIN_DYNAMIC_GLOBAL_BATCH_SIZE_CAP", "0") or "0")
+        configured_min = int(
+            os.environ.get("TRAIN_MIN_DYNAMIC_GLOBAL_BATCH_SIZE", str(max(dp_size, original_gbs // 2))) or "0"
+        )
+        dynamic_gbs = choose_dynamic_global_batch_size(
+            num_samples=num_samples,
+            dp_size=dp_size,
+            original_gbs=original_gbs,
+            configured_cap=configured_cap,
+            configured_min=configured_min,
+        )
 
         if dynamic_gbs == 0:
             # Too few samples, use at least dp_size
             dynamic_gbs = dp_size
             logger.warning(f"num_samples={num_samples} < dp_size={dp_size}, using dp_size as global_batch_size")
 
-        # Calculate how many samples will be discarded
-        wasted = num_samples - dynamic_gbs
+        max_samples_per_rollout = resolve_max_samples_per_rollout(dynamic_gbs)
+        retained = compute_train_trim_length(num_samples, dynamic_gbs, max_samples_per_rollout)
+        train_steps = retained // dynamic_gbs if retained > 0 else 0
+        wasted = num_samples - retained
 
-        if dynamic_gbs != original_gbs or wasted > 0:
+        if dynamic_gbs != original_gbs or wasted > 0 or train_steps > 1:
             logger.info(
-                f"Dynamic global_batch_size: {original_gbs} -> {dynamic_gbs} (num_samples={num_samples}, dp_size={dp_size}, num_steps=1, wasted={wasted})"
+                f"Dynamic global_batch_size: {original_gbs} -> {dynamic_gbs} "
+                f"(num_samples={num_samples}, dp_size={dp_size}, train_steps={train_steps}, wasted={wasted})"
             )
 
         return dynamic_gbs
@@ -1095,7 +1139,7 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
         if custom_log_func(rollout_id, args, data, extra_metrics):
             return
 
-    log_dict = extra_metrics or {}
+    log_dict = _rewrite_eval_aux_metrics(extra_metrics)
     for key in data.keys():
         rewards = data[key]["rewards"]
         log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)

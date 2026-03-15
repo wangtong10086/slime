@@ -1,5 +1,10 @@
 from slime.env_adapters.base import FailureKind, RolloutResult
 from slime.rollout.env_adapter.rollout import _finalize_rollout_metrics, _merge_rollout_metrics
+from slime.ray.rollout_batching import (
+    choose_dynamic_global_batch_size,
+    compute_train_trim_length,
+    resolve_max_samples_per_rollout,
+)
 
 
 class _DummyAdapter:
@@ -83,3 +88,32 @@ def test_rollout_metrics_do_not_sum_config_values_or_rates():
     assert metrics["scheduler/runtime_completed_jobs"] == 48.0
     assert metrics["env/pollution_rate"] == 0.5
     assert metrics["env/runtime_reset_rate"] == 0.5
+
+
+def test_train_trim_length_keeps_multiple_steps(monkeypatch):
+    monkeypatch.setenv("TRAIN_MAX_SAMPLES_PER_ROLLOUT", "128")
+
+    max_samples = resolve_max_samples_per_rollout(32)
+    assert max_samples == 128
+    assert compute_train_trim_length(56, 32, max_samples) == 32
+    assert compute_train_trim_length(96, 32, max_samples) == 96
+    assert compute_train_trim_length(133, 32, max_samples) == 128
+
+    monkeypatch.delenv("TRAIN_MAX_SAMPLES_PER_ROLLOUT", raising=False)
+
+
+def test_dynamic_global_batch_size_prefers_remainder_free_steps():
+    assert choose_dynamic_global_batch_size(
+        num_samples=60,
+        dp_size=1,
+        original_gbs=32,
+        configured_cap=32,
+        configured_min=16,
+    ) == 30
+    assert choose_dynamic_global_batch_size(
+        num_samples=56,
+        dp_size=1,
+        original_gbs=32,
+        configured_cap=32,
+        configured_min=16,
+    ) == 28
