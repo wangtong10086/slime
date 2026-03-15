@@ -15,6 +15,7 @@ from sglang.srt.utils import kill_process_tree
 from urllib3.exceptions import NewConnectionError
 
 from slime.ray.ray_actor import RayActor
+from slime.backends.sglang_utils.memory_budget import resolve_engine_mem_fraction
 from slime.utils.http_utils import get_host_info
 
 logger = logging.getLogger(__name__)
@@ -546,8 +547,8 @@ def _compute_server_args(
     _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
     nnodes = max(1, _gpus_per_engine // args.num_gpus_per_node)
     node_rank = rank % nnodes
-    base = base_gpu_id if base_gpu_id is not None else get_base_gpu_id(args, rank)
-    base = _to_local_gpu_id(base)
+    physical_base_gpu_id = base_gpu_id if base_gpu_id is not None else get_base_gpu_id(args, rank)
+    base = _to_local_gpu_id(physical_base_gpu_id)
     kwargs = {
         "model_path": args.hf_checkpoint,
         "trust_remote_code": True,
@@ -613,6 +614,22 @@ def _compute_server_args(
         logger.info(f"Warning: The following arguments is not supported in the current sglang: {unused_keys}.")
         for key in unused_keys:
             kwargs.pop(key)
+
+    resolved_mem_fraction = resolve_engine_mem_fraction(
+        default_fraction=kwargs.get("mem_fraction_static"),
+        base_gpu_id=physical_base_gpu_id,
+        num_gpus_per_engine=_gpus_per_engine,
+        gpu_id_step=kwargs.get("gpu_id_step", 1),
+    )
+    if resolved_mem_fraction is not None and resolved_mem_fraction != kwargs.get("mem_fraction_static"):
+        logger.info(
+            "Balancing rollout memory budget for rank=%s on GPUs [%s]: mem_fraction_static %s -> %s",
+            rank,
+            ", ".join(str(physical_base_gpu_id + idx * kwargs.get("gpu_id_step", 1)) for idx in range(_gpus_per_engine)),
+            kwargs.get("mem_fraction_static"),
+            resolved_mem_fraction,
+        )
+        kwargs["mem_fraction_static"] = resolved_mem_fraction
 
     return kwargs, external_engine_need_check_fields
 
