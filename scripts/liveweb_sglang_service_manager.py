@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -38,15 +39,38 @@ def wait_for_server(base_url: str, api_key: str, timeout_s: int) -> bool:
     headers = {"Authorization": f"Bearer {api_key}"}
     url = f"{base_url.rstrip('/')}/models"
     deadline = time.time() + timeout_s
+    client = httpx.Client(trust_env=False)
     while time.time() < deadline:
         try:
-            response = httpx.get(url, headers=headers, timeout=15.0)
+            response = client.get(url, headers=headers, timeout=15.0)
             if response.status_code == 200:
+                client.close()
                 return True
         except Exception:
             pass
         time.sleep(3)
+    client.close()
     return False
+
+
+def is_port_listening(port: int, host: str = "127.0.0.1", timeout_s: float = 1.0) -> bool:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout_s)
+    try:
+        sock.connect((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def ensure_port_is_clear(port: int):
+    if is_port_listening(port):
+        raise RuntimeError(
+            f"Port {port} is already accepting connections, but it is not a healthy reusable SGLang server. "
+            "Stop the existing listener or choose a different port."
+        )
 
 
 def get_listener_pid(port: int) -> int:
@@ -268,6 +292,8 @@ def command_start(args):
                 continue
             terminate_pid(listener_pid)
             wait_for_pid_exit(listener_pid)
+
+        ensure_port_is_clear(int(server["port"]))
 
         pid = launch_server(server, args, log_dir)
         running_servers.append(
