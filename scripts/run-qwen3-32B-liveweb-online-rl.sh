@@ -16,6 +16,8 @@ TASK_MIX_PHASE="${TASK_MIX_PHASE:-$([[ "${TRAIN_PHASE}" == "main" ]] && echo mai
 TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
 RUN_ROOT="${RUN_ROOT:-/data/slime_runs/liveweb_online_rl_qwen3_32b_${TIMESTAMP}}"
 RUN_CHECKPOINT_DIR="${RUN_ROOT}/checkpoints"
+LOAD_CHECKPOINT_DIR="${LOAD_CHECKPOINT_DIR:-${RUN_CHECKPOINT_DIR}}"
+RUN_HF_EXPORT_DIR="${RUN_ROOT}/hf_exports"
 LIVEWEB_CACHE_DIR="${LIVEWEB_CACHE_DIR:-/data/liveweb_cache/persistent}"
 LIVEWEB_SERVICE_ROOT="${LIVEWEB_SERVICE_ROOT:-/data/liveweb_sglang_services/liveweb_online_rl_${TIMESTAMP}}"
 WANDB_SETTINGS_FILE="${WANDB_SETTINGS_FILE:-${USER_HOME}/.config/wandb/settings}"
@@ -82,6 +84,7 @@ if [[ ! -d "${REF_LOAD_DIR}" ]]; then
 fi
 
 mkdir -p "${RUN_ROOT}" "${RUN_CHECKPOINT_DIR}" "${LIVEWEB_CACHE_DIR}" "${LIVEWEB_SERVICE_ROOT}" "${RAY_TMPDIR}"
+mkdir -p "${RUN_HF_EXPORT_DIR}"
 
 if (( NUM_ROLLOUT_GPUS % ROLLOUT_NUM_GPUS_PER_ENGINE != 0 )); then
   echo "NUM_ROLLOUT_GPUS (${NUM_ROLLOUT_GPUS}) must be divisible by ROLLOUT_NUM_GPUS_PER_ENGINE (${ROLLOUT_NUM_GPUS_PER_ENGINE})" >&2
@@ -109,6 +112,8 @@ export SLIME_ENV_ADAPTER_PATH="${SLIME_ENV_ADAPTER_PATH:-slime.env_adapters.live
 export TASK_REGISTRY_VERSION="${TASK_REGISTRY_VERSION:-v2}"
 export LIVEWEB_ENABLE_THINKING=0
 export LIVEWEB_SEPARATE_REASONING=1
+export LIVEWEB_TRAIN_TEMPERATURE="${LIVEWEB_TRAIN_TEMPERATURE:-0.6}"
+export LIVEWEB_EVAL_TEMPERATURE="${LIVEWEB_EVAL_TEMPERATURE:-0.0}"
 export LIVEWEB_MAX_COMPLETION_TOKENS
 export LIVEWEB_MAX_STEPS="${MAX_STEPS}"
 export LIVEWEB_TIMEOUT_SECONDS="${LIVEWEB_TIMEOUT_SECONDS:-1800}"
@@ -135,6 +140,12 @@ export LIVEWEB_RUNTIME_JIT_KERNEL_ENABLED="${LIVEWEB_RUNTIME_JIT_KERNEL_ENABLED:
 export LIVEWEB_RUNTIME_KERNEL_FALLBACK="${LIVEWEB_RUNTIME_KERNEL_FALLBACK:-0}"
 export LIVEWEB_RUNTIME_KERNEL_FALLBACK_REASON="${LIVEWEB_RUNTIME_KERNEL_FALLBACK_REASON:-unknown}"
 export LIVEWEB_TASK_MIX_CONFIG="${LIVEWEB_TASK_MIX_CONFIG:-${SLIME_DIR}/scripts/configs/liveweb_online_task_mix.json}"
+export LIVEWEB_EXCLUDE_PLUGINS="${LIVEWEB_EXCLUDE_PLUGINS:-weather,openlibrary}"
+export LIVEWEB_MIN_UNIQUE_PLUGINS="${LIVEWEB_MIN_UNIQUE_PLUGINS:-2}"
+export LIVEWEB_DYNAMIC_SAMPLER_WINDOW="${LIVEWEB_DYNAMIC_SAMPLER_WINDOW:-64}"
+export LIVEWEB_DYNAMIC_SAMPLING_DYNAMIC_RATIO="${LIVEWEB_DYNAMIC_SAMPLING_DYNAMIC_RATIO:-0.5}"
+export LIVEWEB_DYNAMIC_SAMPLING_BASE_RATIO="${LIVEWEB_DYNAMIC_SAMPLING_BASE_RATIO:-0.3}"
+export LIVEWEB_DYNAMIC_SAMPLING_EXPLORE_RATIO="${LIVEWEB_DYNAMIC_SAMPLING_EXPLORE_RATIO:-0.2}"
 export SLIME_DUMP_ROLLOUT_TRAJECTORIES="${SLIME_DUMP_ROLLOUT_TRAJECTORIES:-0}"
 export LIVEWEB_ALLOW_ZERO_STD_FALLBACK="${LIVEWEB_ALLOW_ZERO_STD_FALLBACK:-1}"
 if [[ "${TRAIN_PHASE}" == "main" ]]; then
@@ -245,8 +256,9 @@ COMMON_ARGS=(
   "${MODEL_ARGS[@]}"
   --hf-checkpoint "${HF_MODEL_DIR}"
   --ref-load "${REF_LOAD_DIR}"
-  --load "${RUN_CHECKPOINT_DIR}"
+  --load "${LOAD_CHECKPOINT_DIR}"
   --save "${RUN_CHECKPOINT_DIR}"
+  --save-hf "${RUN_HF_EXPORT_DIR}/iter_{rollout_id:07d}"
   --save-interval "${SAVE_INTERVAL}"
 
   --data-source-path slime.rollout.env_adapter.data_source.AdapterDataSource
@@ -257,7 +269,7 @@ COMMON_ARGS=(
   --environment-name "${SLIME_ENVIRONMENT_NAME}"
   --environment-adapter-path "${SLIME_ENV_ADAPTER_PATH}"
 
-  --advantage-estimator grpo
+  --advantage-estimator gspo
   --use-kl-loss
   --kl-loss-coef 0.01
   --kl-loss-type low_var_kl
@@ -270,8 +282,10 @@ COMMON_ARGS=(
   --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}"
   --rollout-max-prompt-len "${ROLLOUT_MAX_PROMPT_LEN}"
   --rollout-max-response-len "${LIVEWEB_MAX_COMPLETION_TOKENS}"
-  --rollout-temperature 0.7
-  --rollout-top-p 1.0
+  --rollout-temperature 0.6
+  --rollout-top-p 0.95
+  --eval-temperature 0.0
+  --eval-top-p 1.0
 
   --global-batch-size "${GLOBAL_BATCH_SIZE}"
   --use-dynamic-batch-size
@@ -363,6 +377,8 @@ cat > "${RUN_ROOT}/run_config.json" <<JSON
   "sglang_mem_fraction_static": ${SGLANG_MEM_FRACTION_STATIC},
   "sglang_mem_fraction_static_by_gpu_id": "${SGLANG_MEM_FRACTION_STATIC_BY_GPU_ID}",
   "liveweb_max_completion_tokens": ${LIVEWEB_MAX_COMPLETION_TOKENS},
+  "liveweb_train_temperature": ${LIVEWEB_TRAIN_TEMPERATURE},
+  "liveweb_eval_temperature": ${LIVEWEB_EVAL_TEMPERATURE},
   "max_steps": ${MAX_STEPS},
   "recompute_loss_function": ${RECOMPUTE_LOSS_FUNCTION},
   "log_probs_chunk_size": ${LOG_PROBS_CHUNK_SIZE},
@@ -372,6 +388,7 @@ cat > "${RUN_ROOT}/run_config.json" <<JSON
   "update_weights_batch_size": ${TRAIN_UPDATE_WEIGHTS_BATCH_SIZE},
   "ray_memory_usage_threshold": ${RAY_MEMORY_USAGE_THRESHOLD},
   "effective_save_interval": ${SAVE_INTERVAL},
+  "save_hf": "${RUN_HF_EXPORT_DIR}/iter_{rollout_id:07d}",
   "target_active_jobs": ${SLIME_ENV_TARGET_ACTIVE_JOBS},
   "target_ready_groups": ${SLIME_ENV_TARGET_READY_GROUPS},
   "max_parallel_env_jobs": ${SLIME_ENV_MAX_PARALLEL_ENV_JOBS},
@@ -381,10 +398,17 @@ cat > "${RUN_ROOT}/run_config.json" <<JSON
   "runtime_kernel_fallback_reason": "${LIVEWEB_RUNTIME_KERNEL_FALLBACK_REASON}",
   "oversample_factor": ${SLIME_ENV_OVERSAMPLE_FACTOR},
   "dump_rollout_trajectories": ${SLIME_DUMP_ROLLOUT_TRAJECTORIES},
+  "exclude_plugins": "${LIVEWEB_EXCLUDE_PLUGINS}",
+  "min_unique_plugins": ${LIVEWEB_MIN_UNIQUE_PLUGINS},
+  "dynamic_sampler_window": ${LIVEWEB_DYNAMIC_SAMPLER_WINDOW},
+  "dynamic_sampling_dynamic_ratio": ${LIVEWEB_DYNAMIC_SAMPLING_DYNAMIC_RATIO},
+  "dynamic_sampling_base_ratio": ${LIVEWEB_DYNAMIC_SAMPLING_BASE_RATIO},
+  "dynamic_sampling_explore_ratio": ${LIVEWEB_DYNAMIC_SAMPLING_EXPLORE_RATIO},
   "runtime_max_reuse_jobs": ${LIVEWEB_RUNTIME_MAX_REUSE_JOBS},
   "runtime_soft_failure_reset_threshold": ${LIVEWEB_RUNTIME_SOFT_FAILURE_RESET_THRESHOLD},
   "hf_model_dir": "${HF_MODEL_DIR}",
   "ref_load_dir": "${REF_LOAD_DIR}",
+  "load_checkpoint_dir": "${LOAD_CHECKPOINT_DIR}",
   "liveweb_arena_dir": "${LIVEWEB_ARENA_DIR}",
   "liveweb_branch": "$(git -C "${LIVEWEB_ARENA_DIR}" branch --show-current)"
 }
@@ -420,6 +444,8 @@ env_vars = {
     "LIVEWEB_CACHE_DIR": os.environ["LIVEWEB_CACHE_DIR"],
     "LIVEWEB_ENABLE_THINKING": os.environ["LIVEWEB_ENABLE_THINKING"],
     "LIVEWEB_SEPARATE_REASONING": os.environ["LIVEWEB_SEPARATE_REASONING"],
+    "LIVEWEB_TRAIN_TEMPERATURE": os.environ["LIVEWEB_TRAIN_TEMPERATURE"],
+    "LIVEWEB_EVAL_TEMPERATURE": os.environ["LIVEWEB_EVAL_TEMPERATURE"],
     "LIVEWEB_MAX_COMPLETION_TOKENS": os.environ["LIVEWEB_MAX_COMPLETION_TOKENS"],
     "LIVEWEB_MAX_STEPS": os.environ["LIVEWEB_MAX_STEPS"],
     "LIVEWEB_TIMEOUT_SECONDS": os.environ["LIVEWEB_TIMEOUT_SECONDS"],
@@ -442,6 +468,12 @@ env_vars = {
     "LIVEWEB_PREWARM_URLS": os.environ["LIVEWEB_PREWARM_URLS"],
     "LIVEWEB_TASK_MIX_PHASE": os.environ["LIVEWEB_TASK_MIX_PHASE"],
     "LIVEWEB_TASK_MIX_CONFIG": os.environ["LIVEWEB_TASK_MIX_CONFIG"],
+    "LIVEWEB_EXCLUDE_PLUGINS": os.environ["LIVEWEB_EXCLUDE_PLUGINS"],
+    "LIVEWEB_MIN_UNIQUE_PLUGINS": os.environ["LIVEWEB_MIN_UNIQUE_PLUGINS"],
+    "LIVEWEB_DYNAMIC_SAMPLER_WINDOW": os.environ["LIVEWEB_DYNAMIC_SAMPLER_WINDOW"],
+    "LIVEWEB_DYNAMIC_SAMPLING_DYNAMIC_RATIO": os.environ["LIVEWEB_DYNAMIC_SAMPLING_DYNAMIC_RATIO"],
+    "LIVEWEB_DYNAMIC_SAMPLING_BASE_RATIO": os.environ["LIVEWEB_DYNAMIC_SAMPLING_BASE_RATIO"],
+    "LIVEWEB_DYNAMIC_SAMPLING_EXPLORE_RATIO": os.environ["LIVEWEB_DYNAMIC_SAMPLING_EXPLORE_RATIO"],
     "LIVEWEB_MIN_GROUP_SIZE": os.environ["LIVEWEB_MIN_GROUP_SIZE"],
     "LIVEWEB_ALLOW_PARTIAL_GROUP_FALLBACK": os.environ["LIVEWEB_ALLOW_PARTIAL_GROUP_FALLBACK"],
     "LIVEWEB_ALLOW_ENV_FALLBACK_GROUPS": os.environ["LIVEWEB_ALLOW_ENV_FALLBACK_GROUPS"],

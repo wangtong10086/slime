@@ -8,8 +8,6 @@ from urllib.parse import urlparse
 from slime.rollout.liveweb_online.common import (
     LiveWebRolloutState,
     PromptJob,
-    build_eval_jobs,
-    build_prompt_job,
     compute_reward_from_result,
     evaluate_prompt_job,
     get_eval_profile,
@@ -17,6 +15,7 @@ from slime.rollout.liveweb_online.common import (
     should_allow_environment_fallback,
     summarize_cache_stats,
 )
+from slime.rollout.liveweb_online.task_sampling import LiveWebDynamicSampler, parse_plugin_csv_env
 from slime.utils.types import Sample
 
 from .base import (
@@ -39,19 +38,17 @@ class LiveWebEnvironmentAdapter(EnvironmentAdapter):
         self._scoped_states: dict[str, LiveWebRolloutState] = {}
         self._phase = os.getenv("LIVEWEB_TASK_MIX_PHASE", "warmup")
         self._parent_seed_cursor = int(os.getenv("LIVEWEB_TRAIN_BASE_SEED", "100000"))
-        self._curated_warmup_pool = []
-        self._curated_warmup_cursor = 0
-        use_curated_warmup_pool = os.getenv("LIVEWEB_USE_CURATED_WARMUP_POOL", "1") == "1"
-        if self._phase == "warmup" and use_curated_warmup_pool:
-            num_prompts = int(os.getenv("LIVEWEB_WARMUP_POOL_SIZE", os.getenv("LIVEWEB_QUICK_EVAL_PROMPTS", "32")))
-            base_seed = int(os.getenv("LIVEWEB_WARMUP_POOL_BASE_SEED", "900000"))
-            self._curated_warmup_pool = build_eval_jobs(
-                rollout_id=0,
-                dataset_name="warmup_pool",
-                num_prompts=num_prompts,
-                phase="warmup",
-                base_seed=base_seed,
-            )
+        self._excluded_plugins = parse_plugin_csv_env("LIVEWEB_EXCLUDE_PLUGINS", "weather,openlibrary")
+        self._sampler = LiveWebDynamicSampler(
+            excluded_plugins=self._excluded_plugins,
+            min_unique_plugins=int(os.getenv("LIVEWEB_MIN_UNIQUE_PLUGINS", "2")),
+            window_size=int(os.getenv("LIVEWEB_DYNAMIC_SAMPLER_WINDOW", "64")),
+            dynamic_mix=(
+                float(os.getenv("LIVEWEB_DYNAMIC_SAMPLING_DYNAMIC_RATIO", "0.5")),
+                float(os.getenv("LIVEWEB_DYNAMIC_SAMPLING_BASE_RATIO", "0.3")),
+                float(os.getenv("LIVEWEB_DYNAMIC_SAMPLING_EXPLORE_RATIO", "0.2")),
+            ),
+        )
 
     def get_runtime_capabilities(self) -> RuntimeCapabilities:
         return RuntimeCapabilities(
@@ -79,104 +76,59 @@ class LiveWebEnvironmentAdapter(EnvironmentAdapter):
             base_seed = int(os.getenv("LIVEWEB_EVAL_BASE_SEED", "900000"))
             if phase == "main":
                 base_seed += 10000
-            start_seed = base_seed + (0 if rollout_id is None else 0)
             for idx in range(count):
-                parent_seed = start_seed + idx
+                parent_seed = base_seed + idx
+                selection = self._sampler.sample(seed=parent_seed, phase=phase, evaluation=True)
                 tasks.append(
                     TaskSpec(
                         env_name=self.name,
-                        task_family="prompt",
-                        task_id=parent_seed,
+                        task_family="composite_prompt",
+                        task_id=selection["task_id"],
                         seed=parent_seed,
-                        metadata={"phase": phase, "split": split},
+                        metadata={"phase": phase, "split": split, **selection},
                     )
                 )
             return tasks
 
         for _ in range(count):
-            if self._curated_warmup_pool:
-                base_job = self._curated_warmup_pool[self._curated_warmup_cursor % len(self._curated_warmup_pool)]
-                self._curated_warmup_cursor += 1
-                parent_seed = base_job.parent_seed
-                plugin_name = base_job.plugin_name
-            else:
-                parent_seed = self._parent_seed_cursor
-                self._parent_seed_cursor += 1
-                plugin_name = None
+            parent_seed = self._parent_seed_cursor
+            self._parent_seed_cursor += 1
+            selection = self._sampler.sample(seed=parent_seed, phase=phase, evaluation=False)
             tasks.append(
                 TaskSpec(
                     env_name=self.name,
-                    task_family="prompt",
-                    task_id=parent_seed,
+                    task_family="composite_prompt",
+                    task_id=selection["task_id"],
                     seed=parent_seed,
-                    metadata={"phase": phase, "split": split, "plugin_name": plugin_name},
+                    metadata={"phase": phase, "split": split, **selection},
                 )
             )
         return tasks
 
     def expand_jobs(self, *, tasks: list[TaskSpec], n_samples_per_task: int, mode: str) -> list[JobSpec]:
         jobs: list[JobSpec] = []
-        for task_idx, task in enumerate(tasks):
+        for task in tasks:
             parent_seed = int(task.seed)
-            if mode == "eval":
-                plugin_name = str(task.metadata.get("plugin_name") or "")
-                eval_jobs = build_eval_jobs(
-                    rollout_id=0,
-                    dataset_name=mode,
-                    num_prompts=1,
+            sample_count = 1 if mode == "eval" else n_samples_per_task
+            for sample_index in range(sample_count):
+                task_id = int(task.metadata["task_id"])
+                combo_key = str(task.metadata["combo_key"])
+                prompt_job = PromptJob(
+                    parent_seed=parent_seed,
+                    task_id=task_id,
+                    task_seed=int(task.metadata["task_seed"]),
+                    llm_seed=abs(hash((parent_seed, sample_index, "liveweb_online_rl"))) % (2**31 - 1),
+                    subtask_index=1,
+                    num_subtasks=int(task.metadata["num_subtasks"]),
+                    templates=[tuple(item) for item in task.metadata["templates"]],
+                    task_name=f"{mode}:{combo_key}",
+                    plugin_name=combo_key,
+                    plugin_names=list(task.metadata.get("plugin_names") or []),
+                    combo_index=int(task.metadata["combo_index"]),
+                    combo_key=combo_key,
                     phase=str(task.metadata.get("phase", "warmup")),
-                    base_seed=parent_seed,
+                    route_key=f"{mode}:task:{task_id}",
                 )
-                prompt_job = eval_jobs[0]
-                affinity_key = prompt_job.route_key
-                jobs.append(
-                    JobSpec(
-                        env_name=self.name,
-                        job_id=f"{mode}:{parent_seed}",
-                        group_id=f"{mode}:{parent_seed}",
-                        index_in_group=0,
-                        mode=mode,
-                        task=task,
-                        seed=prompt_job.llm_seed,
-                        metadata={"prompt_job": prompt_job.to_metadata(), "plugin_name": plugin_name},
-                        affinity_key=affinity_key,
-                        resource_profile=ResourceProfile({"llm": 1, "env": 1}),
-                        prompt_hint=f"{prompt_job.task_name}:{prompt_job.parent_seed}",
-                    )
-                )
-                continue
-
-            for sample_index in range(n_samples_per_task):
-                if self._curated_warmup_pool and task.metadata.get("plugin_name"):
-                    base_job = next((job for job in self._curated_warmup_pool if job.parent_seed == parent_seed), None)
-                    if base_job is None:
-                        prompt_job = build_prompt_job(
-                            parent_seed=parent_seed,
-                            group_index=task_idx,
-                            sample_index=sample_index,
-                            phase=str(task.metadata.get("phase", "warmup")),
-                        )
-                    else:
-                        llm_seed = abs(hash((parent_seed + task_idx * 1000, sample_index, "liveweb_online_rl"))) % (2**31 - 1)
-                        prompt_job = PromptJob(
-                            parent_seed=base_job.parent_seed,
-                            task_seed=base_job.task_seed,
-                            llm_seed=llm_seed,
-                            subtask_index=base_job.subtask_index,
-                            num_subtasks=base_job.num_subtasks,
-                            templates=list(base_job.templates),
-                            task_name=base_job.task_name,
-                            plugin_name=base_job.plugin_name,
-                            phase=base_job.phase,
-                            route_key=f"{task.metadata.get('phase', 'warmup')}:curated:seed:{parent_seed}:subtask:1",
-                        )
-                else:
-                    prompt_job = build_prompt_job(
-                        parent_seed=parent_seed,
-                        group_index=task_idx,
-                        sample_index=sample_index,
-                        phase=str(task.metadata.get("phase", "warmup")),
-                    )
                 jobs.append(
                     JobSpec(
                         env_name=self.name,
@@ -186,10 +138,15 @@ class LiveWebEnvironmentAdapter(EnvironmentAdapter):
                         mode=mode,
                         task=task,
                         seed=prompt_job.llm_seed,
-                        metadata={"prompt_job": prompt_job.to_metadata(), "plugin_name": prompt_job.plugin_name},
+                        metadata={
+                            "prompt_job": prompt_job.to_metadata(),
+                            "plugin_name": prompt_job.plugin_name,
+                            "combo_key": combo_key,
+                            "sampling_strategy": task.metadata.get("sampling_strategy"),
+                        },
                         affinity_key=prompt_job.route_key,
                         resource_profile=ResourceProfile({"llm": 1, "env": 1}),
-                        prompt_hint=f"{prompt_job.task_name}:{prompt_job.parent_seed}",
+                        prompt_hint=f"{prompt_job.task_name}:{task_id}",
                     )
                 )
         return jobs
@@ -222,7 +179,12 @@ class LiveWebEnvironmentAdapter(EnvironmentAdapter):
             await state.actor.shutdown()
 
     async def run_job(self, args, runtime: LiveWebRolloutState, job: JobSpec, *, evaluation: bool) -> RolloutResult:
-        prompt_job = PromptJob(**job.metadata["prompt_job"])
+        prompt_metadata = dict(job.metadata["prompt_job"])
+        prompt_metadata.setdefault("task_id", int(job.task.task_id))
+        prompt_metadata.setdefault("plugin_names", list(job.task.metadata.get("plugin_names") or []))
+        prompt_metadata.setdefault("combo_index", int(job.task.metadata.get("combo_index", 0)))
+        prompt_metadata.setdefault("combo_key", str(job.task.metadata.get("combo_key") or job.metadata.get("combo_key") or ""))
+        prompt_job = PromptJob(**prompt_metadata)
         result = await evaluate_prompt_job(args, runtime, prompt_job)
         runtime.record_job_outcome(result)
         failure_reason = (result.get("extra") or {}).get("failure_reason")
@@ -374,13 +336,18 @@ class LiveWebEnvironmentAdapter(EnvironmentAdapter):
         return {
             "phase": self._phase,
             "parent_seed_cursor": self._parent_seed_cursor,
-            "curated_warmup_cursor": self._curated_warmup_cursor,
+            "sampler_state": self._sampler.export_state(),
         }
 
     def load_state(self, state: dict[str, Any]) -> None:
         self._phase = state.get("phase", self._phase)
         self._parent_seed_cursor = int(state.get("parent_seed_cursor", self._parent_seed_cursor))
-        self._curated_warmup_cursor = int(state.get("curated_warmup_cursor", self._curated_warmup_cursor))
+        self._sampler.load_state(state.get("sampler_state") or {})
+
+    def record_group_feedback(self, feedback: list[dict[str, Any]], *, evaluation: bool) -> None:
+        if evaluation or not feedback:
+            return
+        self._sampler.record_group_feedback(feedback)
 
     async def shutdown(self) -> None:
         for state in self._scoped_states.values():

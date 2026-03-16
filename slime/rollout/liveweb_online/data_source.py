@@ -48,6 +48,7 @@ class LiveWebOnlineDataSource(DataSource):
                     llm_seed = derive_llm_seed(parent_seed + self.sample_group_index * 1000, sample_offset)
                     job = type(base_job)(
                         parent_seed=base_job.parent_seed,
+                        task_id=base_job.task_id,
                         task_seed=base_job.task_seed,
                         llm_seed=llm_seed,
                         subtask_index=base_job.subtask_index,
@@ -55,6 +56,9 @@ class LiveWebOnlineDataSource(DataSource):
                         templates=list(base_job.templates),
                         task_name=base_job.task_name,
                         plugin_name=base_job.plugin_name,
+                        plugin_names=list(base_job.plugin_names),
+                        combo_index=base_job.combo_index,
+                        combo_key=base_job.combo_key,
                         phase=base_job.phase,
                         route_key=derive_route_key(
                             f"{self.phase}:curated",

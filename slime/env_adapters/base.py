@@ -272,6 +272,9 @@ class EnvironmentAdapter(abc.ABC):
     def snapshot_runtime_metrics(self, scope: str | None = None) -> dict[str, int]:
         return {}
 
+    def record_group_feedback(self, feedback: list[dict[str, Any]], *, evaluation: bool) -> None:
+        return None
+
     def export_state(self) -> dict[str, Any]:
         return {}
 

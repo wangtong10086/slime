@@ -4,7 +4,6 @@ import asyncio
 import copy
 import json
 import os
-import random
 import sys
 import time
 import ipaddress
@@ -18,9 +17,16 @@ import requests
 from slime.utils.processing_utils import load_tokenizer
 from slime.utils.types import Sample
 
+from .task_sampling import (
+    DEFAULT_LIVEWEB_ARENA_DIR,
+    LiveWebDynamicSampler,
+    ensure_liveweb_import_path,
+    full_plugin_allowlist,
+    load_task_mix_config,
+    phase_plugin_weights,
+    stable_plugin_allowlist,
+)
 
-DEFAULT_TASK_MIX_PATH = Path("/home/xmyf/slime/scripts/configs/liveweb_online_task_mix.json")
-DEFAULT_LIVEWEB_ARENA_DIR = Path("/home/xmyf/liveweb-arena")
 ENV_POLLUTION_FAILURES = {"site_unreachable", "cache_error", "llm_error", "rollout_exception"}
 DEFAULT_PREWARM_URLS = {
     "hackernews": [
@@ -36,64 +42,10 @@ DEFAULT_PREWARM_URLS = {
 }
 
 
-def ensure_liveweb_import_path() -> Path:
-    arena_dir = Path(os.getenv("LIVEWEB_ARENA_DIR", str(DEFAULT_LIVEWEB_ARENA_DIR))).resolve()
-    if str(arena_dir) not in sys.path:
-        sys.path.insert(0, str(arena_dir))
-    return arena_dir
-
-
-def load_task_mix_config() -> dict[str, Any]:
-    path = Path(os.getenv("LIVEWEB_TASK_MIX_CONFIG", str(DEFAULT_TASK_MIX_PATH)))
-    return json.loads(path.read_text())
-
-
 def get_phase_name(evaluation: bool = False) -> str:
     if evaluation:
         return os.getenv("LIVEWEB_EVAL_PHASE", "main")
     return os.getenv("LIVEWEB_TASK_MIX_PHASE", "warmup")
-
-
-def stable_plugin_allowlist() -> list[str]:
-    return load_task_mix_config()["stable_plugins"]
-
-
-def full_plugin_allowlist() -> list[str]:
-    return load_task_mix_config()["full_plugins"]
-
-
-def phase_plugin_weights(phase: str) -> dict[str, float]:
-    cfg = load_task_mix_config()["phases"][phase]
-    stable = cfg.get("stable_weight", 1.0)
-    full_weight = cfg.get("full_weight", 0.0)
-
-    weights: dict[str, float] = {}
-    stable_plugins = stable_plugin_allowlist()
-    full_plugins = full_plugin_allowlist()
-    stable_share = stable / max(1, len(stable_plugins))
-    full_share = full_weight / max(1, len(full_plugins))
-    for plugin in stable_plugins:
-        weights[plugin] = weights.get(plugin, 0.0) + stable_share
-    for plugin in full_plugins:
-        weights[plugin] = weights.get(plugin, 0.0) + full_share
-    return weights
-
-
-def weighted_plugin_choice(task_seed: int, phase: str) -> str:
-    weights = phase_plugin_weights(phase)
-    items = sorted(weights.items())
-    plugins = [plugin for plugin, _ in items]
-    probs = [weight for _, weight in items]
-    total = sum(probs)
-    normalized = [p / total for p in probs]
-    rng = random.Random(task_seed)
-    x = rng.random()
-    cumulative = 0.0
-    for plugin, p in zip(plugins, normalized, strict=True):
-        cumulative += p
-        if x <= cumulative:
-            return plugin
-    return plugins[-1]
 
 
 def derive_llm_seed(task_seed: int, sample_index: int) -> int:
@@ -117,6 +69,7 @@ def derive_route_key(
 @dataclass
 class PromptJob:
     parent_seed: int
+    task_id: int
     task_seed: int
     llm_seed: int
     subtask_index: int
@@ -124,12 +77,16 @@ class PromptJob:
     templates: list[tuple[str, str | None, int | None]]
     task_name: str
     plugin_name: str
+    plugin_names: list[str]
+    combo_index: int
+    combo_key: str
     phase: str
     route_key: str
 
     def to_metadata(self) -> dict[str, Any]:
         return {
             "parent_seed": self.parent_seed,
+            "task_id": self.task_id,
             "task_seed": self.task_seed,
             "llm_seed": self.llm_seed,
             "subtask_index": self.subtask_index,
@@ -137,6 +94,9 @@ class PromptJob:
             "templates": self.templates,
             "task_name": self.task_name,
             "plugin_name": self.plugin_name,
+            "plugin_names": list(self.plugin_names),
+            "combo_index": self.combo_index,
+            "combo_key": self.combo_key,
             "phase": self.phase,
             "route_key": self.route_key,
         }
@@ -148,24 +108,35 @@ def build_prompt_job(
     group_index: int,
     sample_index: int,
     phase: str,
+    sampler: LiveWebDynamicSampler | None = None,
 ) -> PromptJob:
-    plugin_name = weighted_plugin_choice(parent_seed, phase)
+    sampler = sampler or LiveWebDynamicSampler(
+        excluded_plugins={item.strip() for item in os.getenv("LIVEWEB_EXCLUDE_PLUGINS", "weather,openlibrary").split(",") if item.strip()},
+        min_unique_plugins=read_int_env("LIVEWEB_MIN_UNIQUE_PLUGINS", 2),
+    )
+    selection = sampler.sample(seed=parent_seed, phase=phase, evaluation=False)
     subtask_index = 1
-    task_seed = parent_seed
-    llm_seed = derive_llm_seed(task_seed, sample_index)
+    task_seed = int(selection["task_seed"])
+    llm_seed = derive_llm_seed(parent_seed, sample_index)
+    combo_key = str(selection["combo_key"])
+    plugin_names = list(selection["plugin_names"])
     return PromptJob(
         parent_seed=parent_seed,
+        task_id=int(selection["task_id"]),
         task_seed=task_seed,
         llm_seed=llm_seed,
         subtask_index=subtask_index,
-        num_subtasks=1,
-        templates=[(plugin_name, None, None)],
-        task_name=f"liveweb_arena:{plugin_name}",
-        plugin_name=plugin_name,
+        num_subtasks=int(selection["num_subtasks"]),
+        templates=[tuple(item) for item in selection["templates"]],
+        task_name=f"liveweb_arena:{combo_key}",
+        plugin_name=combo_key,
+        plugin_names=plugin_names,
+        combo_index=int(selection["combo_index"]),
+        combo_key=combo_key,
         phase=phase,
         route_key=derive_route_key(
-            f"{phase}:prompt",
-            parent_seed,
+            f"{phase}:task",
+            int(selection["task_id"]),
             subtask_index,
             sample_index,
             include_sample_index=False,
@@ -180,23 +151,38 @@ def build_eval_jobs(
     num_prompts: int,
     phase: str,
     base_seed: int,
+    sampler: LiveWebDynamicSampler | None = None,
 ) -> list[PromptJob]:
     jobs = []
+    sampler = sampler or LiveWebDynamicSampler(
+        excluded_plugins={item.strip() for item in os.getenv("LIVEWEB_EXCLUDE_PLUGINS", "weather,openlibrary").split(",") if item.strip()},
+        min_unique_plugins=read_int_env("LIVEWEB_MIN_UNIQUE_PLUGINS", 2),
+    )
     for idx in range(num_prompts):
         parent_seed = base_seed + idx
-        plugin_name = weighted_plugin_choice(parent_seed, phase)
+        selection = sampler.sample(seed=parent_seed, phase=phase, evaluation=True)
         jobs.append(
             PromptJob(
                 parent_seed=parent_seed,
-                task_seed=parent_seed,
+                task_id=int(selection["task_id"]),
+                task_seed=int(selection["task_seed"]),
                 llm_seed=derive_llm_seed(parent_seed + rollout_id * 10_000, idx),
                 subtask_index=1,
-                num_subtasks=1,
-                templates=[(plugin_name, None, None)],
-                task_name=f"{dataset_name}:{plugin_name}",
-                plugin_name=plugin_name,
+                num_subtasks=int(selection["num_subtasks"]),
+                templates=[tuple(item) for item in selection["templates"]],
+                task_name=f"{dataset_name}:{selection['combo_key']}",
+                plugin_name=str(selection["combo_key"]),
+                plugin_names=list(selection["plugin_names"]),
+                combo_index=int(selection["combo_index"]),
+                combo_key=str(selection["combo_key"]),
                 phase=phase,
-                route_key=derive_route_key(f"eval:{dataset_name}", parent_seed, 1, idx),
+                route_key=derive_route_key(
+                    f"eval:{dataset_name}",
+                    int(selection["task_id"]),
+                    1,
+                    idx,
+                    include_sample_index=False,
+                ),
             )
         )
     return jobs
@@ -267,16 +253,41 @@ def compute_reward_from_result(result: dict[str, Any]) -> tuple[float | None, di
             "raw_reward": result.get("score", 0.0),
         }
 
-    reward = float(result.get("score", 0.0))
+    final_score = float(result.get("score", 0.0))
+    shaping = 0.0
+
+    required_domains = set(extra.get("required_domains") or [])
+    visited_domains = set(extra.get("visited_domains") or [])
+    if required_domains:
+        visited_required = len(required_domains & visited_domains)
+        shaping += min(0.06, 0.02 * visited_required)
+        if visited_required >= 2 and final_score > 0.0:
+            shaping += 0.03
+
+    answer_details = extra.get("answer_details") or []
+    valid_answers = sum(1 for item in answer_details if item.get("actual") not in (None, "", [], {}))
+    shaping += min(0.05, 0.01 * valid_answers)
+
     if failure_reason == "parse_failed":
-        reward -= 0.10
-    elif failure_reason == "max_steps_reached":
-        reward -= 0.05
-    reward = min(1.0, max(-0.10, reward))
+        shaping -= 0.10
+    if failure_reason is None and required_domains and not required_domains.issubset(visited_domains):
+        shaping -= 0.05
+
+    no_progress_steps = 0
+    for step_reward in (result.get("rewards") or {}).get("step_rewards") or []:
+        for signal in step_reward.get("signals") or []:
+            if signal.get("signal") == "no_progress":
+                no_progress_steps += 1
+    shaping -= min(0.05, 0.01 * no_progress_steps)
+
+    shaping = min(0.15, max(-0.15, shaping))
+    reward = min(1.0, max(-0.15, final_score + shaping))
     return reward, {
         "drop_reason": None,
         "environment_failure_type": None,
-        "raw_reward": float(result.get("score", 0.0)),
+        "raw_reward": final_score,
+        "final_score": final_score,
+        "shaping_reward": shaping,
     }
 
 
@@ -442,6 +453,11 @@ def make_sample_from_result(
         "cache_stats": (result.get("extra") or {}).get("cache_stats") or {},
         "usage": (result.get("extra") or {}).get("usage") or {},
         "answer_details": (result.get("extra") or {}).get("answer_details") or [],
+        "task_id": (result.get("extra") or {}).get("task_id"),
+        "combo_key": (result.get("extra") or {}).get("combo_key"),
+        "plugin_names": (result.get("extra") or {}).get("plugin_names") or [],
+        "required_domains": (result.get("extra") or {}).get("required_domains") or [],
+        "visited_domains": (result.get("extra") or {}).get("visited_domains") or [],
     }
     usage = sample.metadata["usage"]
     sample.metadata["prompt_tokens"] = usage.get("prompt_tokens", 0)
@@ -720,6 +736,12 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
             )
 
             exception_stage = "agent_loop"
+            rollout_temperature = float(
+                os.getenv(
+                    "LIVEWEB_EVAL_TEMPERATURE" if state._rollout_phase == "eval" else "LIVEWEB_TRAIN_TEMPERATURE",
+                    os.getenv("LIVEWEB_TEMPERATURE", "0.7"),
+                )
+            )
             trajectory, final_answer, usage, failure_reason, error_message, _ = await actor._run_agent_loop(
                 task=task,
                 session=session,
@@ -728,7 +750,7 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
                 model=os.getenv("LIVEWEB_MODEL_NAME", args.hf_checkpoint),
                 max_steps=effective_max_steps,
                 timeout=read_int_env("LIVEWEB_TIMEOUT_SECONDS", 1800),
-                temperature=float(os.getenv("LIVEWEB_TEMPERATURE", "0.7")),
+                temperature=rollout_temperature,
                 seed=job.llm_seed,
                 allowed_domains=allowed_domains,
                 on_navigation=on_navigation,
@@ -840,11 +862,14 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
                 "time_taken": time.time() - start_time,
                 "extra": {
                     "seed": job.task_seed,
+                    "task_id": job.task_id,
                     "task_seed": job.task_seed,
                     "llm_seed": job.llm_seed,
                     "parent_seed": job.parent_seed,
                     "subtask_index": job.subtask_index,
                     "num_subtasks": job.num_subtasks,
+                    "combo_index": job.combo_index,
+                    "combo_key": job.combo_key,
                     "final_url": final_url,
                     "output_format": output_format,
                     "usage": usage,
@@ -854,6 +879,9 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
                     "cache_stats": interceptor_stats,
                     "steps_used": len(trajectory),
                     "plugin_name": job.plugin_name,
+                    "plugin_names": list(job.plugin_names),
+                    "required_domains": sorted(allowed_domains),
+                    "visited_domains": sorted(reward_calc.get_state().get("visited_domains", [])),
                     "browser_rebuild_count": state.browser_rebuild_count,
                     "browser_reuse_failures": state.browser_reuse_failures,
                     "browser_recovery_success_count": state.browser_recovery_success_count,
@@ -910,11 +938,14 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
         "time_taken": time.time() - start_time,
         "extra": {
             "seed": job.task_seed,
+            "task_id": job.task_id,
             "task_seed": job.task_seed,
             "llm_seed": job.llm_seed,
             "parent_seed": job.parent_seed,
             "subtask_index": job.subtask_index,
             "num_subtasks": job.num_subtasks,
+            "combo_index": job.combo_index,
+            "combo_key": job.combo_key,
             "final_url": None,
             "usage": None,
             "answer_details": [],
@@ -923,6 +954,9 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
             "cache_stats": {},
             "steps_used": 0,
             "plugin_name": job.plugin_name,
+            "plugin_names": list(job.plugin_names),
+            "required_domains": [],
+            "visited_domains": [],
             "exception_type": type(exc).__name__,
             "exception_stage": last_stage,
             "browser_transport_closed": browser_transport_closed,

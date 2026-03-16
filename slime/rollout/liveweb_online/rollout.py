@@ -71,6 +71,7 @@ async def _run_prompt_job(
     metadata = sample.metadata or {}
     job = PromptJob(
         parent_seed=int(metadata["parent_seed"]),
+        task_id=int(metadata.get("task_id", metadata["parent_seed"])),
         task_seed=int(metadata["task_seed"]),
         llm_seed=int(metadata["llm_seed"]),
         subtask_index=int(metadata["subtask_index"]),
@@ -78,6 +79,9 @@ async def _run_prompt_job(
         templates=[tuple(item) for item in metadata["templates"]],
         task_name=str(metadata["task_name"]),
         plugin_name=str(metadata["plugin_name"]),
+        plugin_names=list(metadata.get("plugin_names") or [str(metadata["plugin_name"])]),
+        combo_index=int(metadata.get("combo_index", 0)),
+        combo_key=str(metadata.get("combo_key", metadata["plugin_name"])),
         phase=str(metadata["phase"]),
         route_key=str(metadata["route_key"]),
     )

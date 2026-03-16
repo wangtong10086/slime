@@ -318,6 +318,7 @@ def _run_groups(args, groups: list[list[Sample]], evaluation: bool, rollout_id: 
     dropped_groups = 0
     zero_std_groups = 0
     partial_groups = 0
+    group_feedback: list[dict[str, Any]] = []
 
     for group_position in range(len(groups)):
         entries = sorted(grouped_results[group_position], key=lambda item: item[0])
@@ -331,6 +332,14 @@ def _run_groups(args, groups: list[list[Sample]], evaluation: bool, rollout_id: 
         if evaluation:
             accepted_groups.append(group_samples)
             continue
+        combo_key = ""
+        if groups[group_position]:
+            job_spec = groups[group_position][0].metadata.get("job_spec", {})
+            combo_key = (
+                ((job_spec.get("metadata") or {}).get("combo_key"))
+                or ((job_spec.get("task") or {}).get("metadata") or {}).get("combo_key")
+                or ""
+            )
         valid_group_samples = [sample for sample in group_samples if sample.response_length > 0]
         dropped_for_zero_response = len(group_samples) - len(valid_group_samples)
         if dropped_for_zero_response:
@@ -347,11 +356,27 @@ def _run_groups(args, groups: list[list[Sample]], evaluation: bool, rollout_id: 
         if len(group_samples) != len(groups[0]):
             partial_groups += 1
         rewards = [float(sample.reward) for sample in group_samples if sample.reward is not None]
-        if len(set(round(reward, 8) for reward in rewards)) <= 1:
+        zero_std = len(set(round(reward, 8) for reward in rewards)) <= 1
+        group_feedback.append(
+            {
+                "combo_key": combo_key,
+                "mean_score": (sum(item.reward for item in group_results) / len(group_results)) if group_results else 0.0,
+                "success_rate": (
+                    sum(1.0 if item.success else 0.0 for item in group_results) / len(group_results)
+                ) if group_results else 0.0,
+                "env_error_rate": (
+                    sum(1.0 if item.environment_pollution else 0.0 for item in group_results) / len(group_results)
+                ) if group_results else 0.0,
+                "accepted": False,
+                "zero_std": zero_std,
+            }
+        )
+        if zero_std:
             zero_std_groups += 1
             if allow_zero_std_fallback:
                 zero_std_fallback_groups.append(group_samples)
             continue
+        group_feedback[-1]["accepted"] = True
         accepted_groups.append(group_samples)
 
     zero_std_fallback_used = 0
@@ -366,6 +391,7 @@ def _run_groups(args, groups: list[list[Sample]], evaluation: bool, rollout_id: 
     if not evaluation and not accepted_groups and allow_last_resort_group_fallback and nonempty_fallback_groups:
         accepted_groups = list(nonempty_fallback_groups)
         last_resort_fallback_used = len(accepted_groups)
+    state.adapter.record_group_feedback(group_feedback, evaluation=evaluation)
 
     metrics = {
         "env/accepted_groups": float(len(accepted_groups)),
