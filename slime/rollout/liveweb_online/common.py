@@ -270,6 +270,8 @@ def compute_reward_from_result(result: dict[str, Any]) -> tuple[float | None, di
 
     if failure_reason == "parse_failed":
         shaping -= 0.10
+    if failure_reason == "max_steps_reached":
+        shaping -= 0.05
     if failure_reason is None and required_domains and not required_domains.issubset(visited_domains):
         shaping -= 0.05
 

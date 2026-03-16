@@ -49,3 +49,27 @@ def test_liveweb_dynamic_sampler_downweights_noisy_zero_std_combos(monkeypatch):
     assert sampler.compute_dynamic_weight(high_value, phase="main") > sampler.compute_dynamic_weight(
         low_value, phase="main"
     )
+
+
+def test_liveweb_dynamic_sampler_penalizes_noise_more_aggressively_in_warmup(monkeypatch):
+    monkeypatch.setenv("TASK_REGISTRY_VERSION", "v2")
+
+    sampler = LiveWebDynamicSampler(excluded_plugins={"weather", "openlibrary"}, min_unique_plugins=2)
+    candidate = sampler.candidates[0]
+    sampler.record_group_feedback(
+        [
+            {
+                "combo_key": candidate.combo_key,
+                "mean_score": 0.05,
+                "success_rate": 0.05,
+                "env_error_rate": 0.4,
+                "accepted": False,
+                "zero_std": True,
+            }
+            for _ in range(8)
+        ]
+    )
+
+    assert sampler.compute_dynamic_weight(candidate, phase="warmup") < sampler.compute_dynamic_weight(
+        candidate, phase="main"
+    )

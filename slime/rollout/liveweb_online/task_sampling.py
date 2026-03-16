@@ -207,8 +207,14 @@ class LiveWebDynamicSampler:
             difficulty_weight = 1.25 - abs(success_rate - 0.3) * 2.0
             difficulty_weight = min(1.5, max(0.5, difficulty_weight))
 
-        noise_penalty = max(0.25, 1.0 - summary["env_error_rate"])
-        zero_std_penalty = max(0.25, 1.0 - (summary["zero_std_rate"] * 0.75))
+        if phase == "warmup":
+            penalty_floor = 0.10
+            noise_penalty = max(penalty_floor, 1.0 - (summary["env_error_rate"] * 1.5))
+            zero_std_penalty = max(penalty_floor, 1.0 - summary["zero_std_rate"])
+        else:
+            penalty_floor = 0.25
+            noise_penalty = max(penalty_floor, 1.0 - summary["env_error_rate"])
+            zero_std_penalty = max(penalty_floor, 1.0 - (summary["zero_std_rate"] * 0.75))
         return base * utility_weight * difficulty_weight * noise_penalty * zero_std_penalty
 
     def sample(self, *, seed: int, phase: str, evaluation: bool = False) -> dict[str, Any]:

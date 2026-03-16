@@ -655,6 +655,30 @@ def train(
             if primary_lr is not None:
                 log_dict[f"train/{role_tag}learning_rate"] = primary_lr
 
+            rollout_step_token_counts = data_iterator[0].rollout_data.get("train_step_token_counts")
+            if rollout_step_token_counts is not None:
+                log_dict["train/step_token_budget"] = data_iterator[0].rollout_data.get("train_step_token_budget", 0)
+                log_dict["train/actual_step_token_mean"] = sum(rollout_step_token_counts) / len(rollout_step_token_counts)
+                log_dict["train/actual_step_token_max"] = max(rollout_step_token_counts)
+                log_dict["train/actual_step_tokens"] = rollout_step_token_counts[step_id]
+                rollout_step_long_sample_counts = data_iterator[0].rollout_data.get("train_step_long_sample_counts") or []
+                if rollout_step_long_sample_counts:
+                    log_dict["train/step_long_sample_mean"] = sum(rollout_step_long_sample_counts) / len(
+                        rollout_step_long_sample_counts
+                    )
+                    log_dict["train/step_long_sample_max"] = max(rollout_step_long_sample_counts)
+                    log_dict["train/step_long_samples"] = rollout_step_long_sample_counts[step_id]
+                log_dict["train/underfilled_steps"] = data_iterator[0].rollout_data.get("train_underfilled_steps", 0)
+                log_dict["train/oversize_samples_dropped"] = data_iterator[0].rollout_data.get(
+                    "train_oversize_samples_dropped", 0
+                )
+                log_dict["train/long_samples_trimmed"] = data_iterator[0].rollout_data.get(
+                    "train_long_samples_trimmed", 0
+                )
+                log_dict["train/density_restricted_steps"] = data_iterator[0].rollout_data.get(
+                    "train_density_restricted_steps", 0
+                )
+
             if args.loss_type == "sft_loss":
                 loss_key = f"train/{role_tag}loss"
                 if loss_key in log_dict:

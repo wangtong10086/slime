@@ -121,6 +121,41 @@ def compute_gspo_kl(
     return ppo_kl
 
 
+def compute_gspo_sequence_kl(
+    full_log_probs: list[torch.Tensor],
+    full_old_log_probs: list[torch.Tensor],
+    loss_masks: list[torch.Tensor],
+) -> list[torch.Tensor]:
+    """Compute one sequence-level KL scalar per sample for GSPO."""
+    return [
+        ((old_logprob - log_prob) * loss_mask).sum() / torch.clamp_min(loss_mask.sum(), 1)
+        for log_prob, old_logprob, loss_mask in zip(full_log_probs, full_old_log_probs, loss_masks, strict=False)
+    ]
+
+
+def compute_gspo_sequence_policy_tensors(
+    sequence_kls: list[torch.Tensor],
+    advantages: list[torch.Tensor],
+    eps_clip: float,
+    eps_clip_high: float,
+    eps_clip_c: float | None = None,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Compute GSPO policy loss tensors without expanding sequence KL to token tensors first."""
+    per_token_pg_losses = []
+    per_token_clipfracs = []
+    for sequence_kl, advantage in zip(sequence_kls, advantages, strict=False):
+        pg_loss, clipfrac = compute_policy_loss(
+            sequence_kl,
+            advantage,
+            eps_clip,
+            eps_clip_high,
+            eps_clip_c,
+        )
+        per_token_pg_losses.append(pg_loss)
+        per_token_clipfracs.append(clipfrac)
+    return per_token_pg_losses, per_token_clipfracs
+
+
 @torch.compile(dynamic=True)
 def compute_policy_loss(
     ppo_kl: torch.Tensor,

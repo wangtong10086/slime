@@ -1,3 +1,4 @@
+import os
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -14,6 +15,8 @@ from slime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
     compute_gspo_kl,
+    compute_gspo_sequence_kl,
+    compute_gspo_sequence_policy_tensors,
     compute_opsm_mask,
     compute_policy_loss,
     get_advantages_and_returns_batch,
@@ -640,8 +643,9 @@ def policy_loss_function(
         "tis", "ois", "tis_clipfrac" are included when the respective features
         are enabled.
     """
-    advantages = torch.cat(batch["advantages"], dim=0)
-    old_log_probs = batch["rollout_log_probs"] if args.use_rollout_logprobs else batch["log_probs"]
+    advantages_list = batch["advantages"]
+    advantages = torch.cat(advantages_list, dim=0)
+    old_log_probs_list = batch["rollout_log_probs"] if args.use_rollout_logprobs else batch["log_probs"]
 
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
@@ -674,7 +678,7 @@ def policy_loss_function(
         full_old_log_probs = [
             all_gather_with_cp(old_log_prob, total_length, response_length)
             for old_log_prob, total_length, response_length in zip(
-                old_log_probs, total_lengths, response_lengths, strict=False
+                old_log_probs_list, total_lengths, response_lengths, strict=False
             )
         ]
 
@@ -689,21 +693,53 @@ def policy_loss_function(
         )
 
     # Compute KL divergence (GSPO uses sequence-level KL, others use per-token KL)
-    if args.advantage_estimator == "gspo":
-        ppo_kl = compute_gspo_kl(
+    use_gspo_sequence_level_loss = (
+        args.advantage_estimator == "gspo"
+        and os.environ.get("GSPO_SEQUENCE_LEVEL_LOSS", "1") == "1"
+        and not args.use_opsm
+        and not args.get_mismatch_metrics
+        and not args.use_tis
+    )
+    if use_gspo_sequence_level_loss:
+        sequence_kl = compute_gspo_sequence_kl(
             full_log_probs=full_log_probs,
             full_old_log_probs=full_old_log_probs,
-            local_log_probs=log_probs,
             loss_masks=batch["loss_masks"],
         )
-        old_log_probs = torch.cat(old_log_probs, dim=0)
+        del full_log_probs
+        del full_old_log_probs
+        full_log_probs = None
+        full_old_log_probs = None
+
+        per_token_pg_loss, per_token_clipfrac = compute_gspo_sequence_policy_tensors(
+            sequence_kls=sequence_kl,
+            advantages=advantages_list,
+            eps_clip=args.eps_clip,
+            eps_clip_high=args.eps_clip_high,
+            eps_clip_c=getattr(args, "eps_clip_c", None),
+        )
+        pg_loss = torch.cat(per_token_pg_loss, dim=0)
+        pg_clipfrac = torch.cat(per_token_clipfrac, dim=0)
+        ppo_kl = torch.stack(sequence_kl).mean()
+        old_log_probs = torch.cat(old_log_probs_list, dim=0)
         log_probs = torch.cat(log_probs, dim=0)
     else:
-        old_log_probs = torch.cat(old_log_probs, dim=0)
+        if args.advantage_estimator == "gspo":
+            ppo_kl = compute_gspo_kl(
+                full_log_probs=full_log_probs,
+                full_old_log_probs=full_old_log_probs,
+                local_log_probs=log_probs,
+                loss_masks=batch["loss_masks"],
+            )
+        old_log_probs = torch.cat(old_log_probs_list, dim=0)
         log_probs = torch.cat(log_probs, dim=0)
-        ppo_kl = old_log_probs - log_probs
-
-    pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
+        if args.advantage_estimator != "gspo":
+            ppo_kl = old_log_probs - log_probs
+        pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
+        if isinstance(full_log_probs, list):
+            del full_log_probs
+        if isinstance(full_old_log_probs, list):
+            del full_old_log_probs
 
     if args.use_opsm:
         pg_loss = pg_loss * opsm_mask
@@ -763,12 +799,14 @@ def policy_loss_function(
 
     pg_loss = pg_loss_reducer(pg_loss)
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
-    ppo_kl = sum_of_sample_mean(ppo_kl)
+    if isinstance(ppo_kl, torch.Tensor) and ppo_kl.dim() > 0:
+        ppo_kl = sum_of_sample_mean(ppo_kl)
 
     # entropy loss
     entropy = log_probs_and_entropy["entropy"]
     entropy = torch.cat(entropy, dim=0)
     entropy_loss = sum_of_sample_mean(entropy)
+    del log_probs_and_entropy
 
     loss = pg_loss - args.entropy_coef * entropy_loss
 
@@ -796,6 +834,7 @@ def policy_loss_function(
     if "rollout_log_probs" in batch and batch["rollout_log_probs"]:
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
         train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
+        del rollout_log_probs
 
     reported_loss = {
         "loss": loss.clone().detach(),
@@ -827,6 +866,11 @@ def policy_loss_function(
     if "opd_reverse_kl" in batch:
         opd_reverse_kl = torch.cat(batch["opd_reverse_kl"], dim=0)
         reported_loss["opd_reverse_kl"] = sum_of_sample_mean(opd_reverse_kl).clone().detach()
+        del opd_reverse_kl
+
+    del advantages
+    del old_log_probs
+    del log_probs
 
     return loss, reported_loss
 

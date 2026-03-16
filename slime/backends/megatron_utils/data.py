@@ -1,4 +1,5 @@
 import logging
+import numbers
 from argparse import Namespace
 from collections.abc import Sequence
 
@@ -52,9 +53,6 @@ def get_batch(
 
     assert "tokens" in keys
     batch = data_iterator.get_next(keys)
-
-    if "dynamic_global_batch_size" in data_iterator.rollout_data:
-        batch["dynamic_global_batch_size"] = data_iterator.rollout_data["dynamic_global_batch_size"]
 
     tokens = batch["tokens"]
     # use 0 as the pad token id should be fine?
@@ -239,6 +237,9 @@ class DataIterator:
         rollout_data: RolloutBatch,
         micro_batch_size: int | None = None,
         micro_batch_indices: list[list[int]] | None = None,
+        step_batch_sizes: list[int] | None = None,
+        step_token_counts: list[int] | None = None,
+        step_microbatch_counts: list[int] | None = None,
     ) -> None:
         """Initialize an iterator over `rollout_data`.
 
@@ -251,8 +252,18 @@ class DataIterator:
         self.rollout_data = rollout_data
         self.micro_batch_size = micro_batch_size
         self.micro_batch_indices = micro_batch_indices
+        self.step_batch_sizes = step_batch_sizes
+        self.step_token_counts = step_token_counts
+        self.step_microbatch_counts = step_microbatch_counts
         assert micro_batch_size is None or micro_batch_indices is None
         self.offset = 0
+        self.microbatch_offset = 0
+        if step_microbatch_counts is not None:
+            self.step_ids_for_microbatch = [
+                step_id for step_id, count in enumerate(step_microbatch_counts) for _ in range(count)
+            ]
+        else:
+            self.step_ids_for_microbatch = None
 
     def get_next(self, keys: Sequence[str]) -> dict[str, list[object] | None]:
         """Return the next micro-batch for the requested keys.
@@ -283,11 +294,22 @@ class DataIterator:
             self.offset += 1
         else:
             self.offset += self.micro_batch_size
+        if self.step_ids_for_microbatch is not None:
+            step_id = self.step_ids_for_microbatch[self.microbatch_offset]
+            if self.step_batch_sizes is not None:
+                batch["dynamic_global_batch_size"] = self.step_batch_sizes[step_id]
+            if self.step_token_counts is not None:
+                batch["train_step_token_count"] = self.step_token_counts[step_id]
+            batch["train_step_id"] = step_id
+        elif "dynamic_global_batch_size" in self.rollout_data:
+            batch["dynamic_global_batch_size"] = self.rollout_data["dynamic_global_batch_size"]
+        self.microbatch_offset += 1
         return batch
 
     def reset(self) -> "DataIterator":
         """Reset internal offset to the start and return self."""
         self.offset = 0
+        self.microbatch_offset = 0
         return self
 
 
@@ -325,33 +347,92 @@ def get_data_iterator(
     num_local_samples = len(rollout_data["total_lengths"])
     global_batch_size = rollout_data.get("dynamic_global_batch_size", args.global_batch_size)
     num_local_gbs = global_batch_size // dp_size
-    num_steps_per_rollout = num_local_samples // num_local_gbs
+    train_step_boundaries = rollout_data.get("train_step_boundaries")
+    train_step_token_counts = rollout_data.get("train_step_token_counts")
+    train_step_num_samples = rollout_data.get("train_step_num_samples")
+    train_step_long_sample_counts = rollout_data.get("train_step_long_sample_counts")
+    if train_step_boundaries is not None:
+        num_steps_per_rollout = len(train_step_boundaries) - 1
+    else:
+        num_steps_per_rollout = num_local_samples // num_local_gbs
 
     if global_batch_size != args.global_batch_size:
         logger.info(
             f"Using dynamic global_batch_size={global_batch_size} (original={args.global_batch_size}), "
             f"num_local_samples={num_local_samples}, num_steps_per_rollout={num_steps_per_rollout}"
         )
+    if train_step_boundaries is not None:
+        logger.info(
+            "Using token-aware train step plan: "
+            f"step_sizes={train_step_num_samples}, step_tokens={train_step_token_counts}, "
+            f"step_long_samples={train_step_long_sample_counts}, "
+            f"token_budget={rollout_data.get('train_step_token_budget')}"
+        )
 
-    def _generate_data_iterator(rollout_data, micro_batch_size, micro_batch_indices=None):
+    def _generate_data_iterator(
+        rollout_data,
+        micro_batch_size,
+        micro_batch_indices=None,
+        step_batch_sizes=None,
+        step_token_counts=None,
+        step_microbatch_counts=None,
+    ):
         data_iterator = []
         for _ in range(vpp_size):
-            data_iterator.append(DataIterator(rollout_data, micro_batch_size, micro_batch_indices))
+            data_iterator.append(
+                DataIterator(
+                    rollout_data,
+                    micro_batch_size,
+                    micro_batch_indices,
+                    step_batch_sizes,
+                    step_token_counts,
+                    step_microbatch_counts,
+                )
+            )
         return data_iterator
 
     if not args.use_dynamic_batch_size:
-        num_microbatches = [num_local_gbs // args.micro_batch_size for _ in range(num_steps_per_rollout)]
-        data_iterator = _generate_data_iterator(rollout_data, args.micro_batch_size)
+        if train_step_boundaries is None:
+            num_microbatches = [num_local_gbs // args.micro_batch_size for _ in range(num_steps_per_rollout)]
+            data_iterator = _generate_data_iterator(rollout_data, args.micro_batch_size)
+        else:
+            num_microbatches = []
+            micro_batch_indices = []
+            step_batch_sizes = []
+            for i in range(num_steps_per_rollout):
+                start, end = train_step_boundaries[i], train_step_boundaries[i + 1]
+                step_batch_size = end - start
+                step_batch_sizes.append(step_batch_size)
+                step_indices = list(range(start, end))
+                step_num_microbatches = (step_batch_size + args.micro_batch_size - 1) // args.micro_batch_size
+                num_microbatches.append(step_num_microbatches)
+                for mb_id in range(step_num_microbatches):
+                    mb_start = mb_id * args.micro_batch_size
+                    mb_end = min(step_batch_size, (mb_id + 1) * args.micro_batch_size)
+                    micro_batch_indices.append(step_indices[mb_start:mb_end])
+            data_iterator = _generate_data_iterator(
+                rollout_data,
+                None,
+                micro_batch_indices,
+                step_batch_sizes,
+                train_step_token_counts,
+                num_microbatches,
+            )
     else:
         assert args.max_tokens_per_gpu is not None
-        # calculate the number of mirobatches for each step
-        samples = rollout_data["total_lengths"]
-        assert len(samples) == num_local_samples
         num_microbatches = []
+        step_batch_sizes = []
         for i in range(num_steps_per_rollout):
-            start, end = i * num_local_gbs, (i + 1) * num_local_gbs
+            if train_step_boundaries is None:
+                start, end = i * num_local_gbs, (i + 1) * num_local_gbs
+            else:
+                start, end = train_step_boundaries[i], train_step_boundaries[i + 1]
+            step_batch_sizes.append(end - start)
             num_microbatches.append(
-                get_minimum_num_micro_batch_size(samples[start:end], args.max_tokens_per_gpu * cp_size)
+                get_minimum_num_micro_batch_size(
+                    rollout_data["total_lengths"][start:end],
+                    args.max_tokens_per_gpu * cp_size,
+                )
             )
 
         num_microbatches = torch.tensor(num_microbatches, dtype=torch.int, device=torch.cuda.current_device())
@@ -366,12 +447,12 @@ def get_data_iterator(
 
         num_microbatches = num_microbatches.tolist()
 
-        # balance the each micro batch
-        samples = rollout_data["total_lengths"]
-        # balance the number of mirobatches across steps
         micro_batch_indices = []
         for i, num_mbs in enumerate(num_microbatches):
-            start, end = i * num_local_gbs, (i + 1) * num_local_gbs
+            if train_step_boundaries is None:
+                start, end = i * num_local_gbs, (i + 1) * num_local_gbs
+            else:
+                start, end = train_step_boundaries[i], train_step_boundaries[i + 1]
             samples = rollout_data["total_lengths"][start:end]
             partitions = get_seqlen_balanced_partitions(samples, num_mbs, equal_size=False)
             for j in range(num_mbs):
@@ -381,7 +462,14 @@ def get_data_iterator(
 
         assert len(set(sum(micro_batch_indices, []))) == num_local_samples
 
-        data_iterator = _generate_data_iterator(rollout_data, None, micro_batch_indices)
+        data_iterator = _generate_data_iterator(
+            rollout_data,
+            None,
+            micro_batch_indices,
+            step_batch_sizes,
+            train_step_token_counts,
+            num_microbatches,
+        )
 
     return (
         data_iterator,
@@ -455,6 +543,8 @@ def log_rollout_data(
                     val = sum(val) / len(val)
             elif isinstance(val, torch.Tensor):
                 val = val.float().mean()
+            elif isinstance(val, numbers.Real):
+                val = float(val)
             else:
                 raise ValueError(f"Unsupported type: {type(val)} for key: {key}")
             log_dict[key] = val.item() if isinstance(val, torch.Tensor) else val

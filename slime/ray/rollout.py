@@ -28,7 +28,12 @@ from slime.utils.types import Sample
 
 from ..utils.metric_utils import has_repetition
 from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
-from .rollout_batching import choose_dynamic_global_batch_size, compute_train_trim_length, resolve_max_samples_per_rollout
+from .rollout_batching import (
+    choose_dynamic_global_batch_size,
+    compute_train_trim_length,
+    plan_train_steps_by_token_budget,
+    resolve_max_samples_per_rollout,
+)
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -571,6 +576,15 @@ class RolloutManager:
         return ray.get([engine.check_weights.remote(action=action) for engine in self.rollout_engines])
 
     def _get_rollout_data(self, rollout_id):
+        self._train_step_boundaries = None
+        self._train_step_token_counts = None
+        self._train_step_num_samples = None
+        self._train_step_long_sample_counts = None
+        self._train_step_token_budget = None
+        self._train_oversize_samples_dropped = 0
+        self._train_underfilled_steps = 0
+        self._train_long_samples_trimmed = 0
+        self._train_density_restricted_steps = 0
         if self.args.load_debug_rollout_data:
             data = torch.load(
                 self.args.load_debug_rollout_data.format(rollout_id=rollout_id),
@@ -594,32 +608,128 @@ class RolloutManager:
                 data = list(itertools.chain.from_iterable(data))
 
             if not self.args.disable_rollout_trim_samples and not self.args.debug_rollout_only:
+                requested_samples = len(data)
                 global_batch_size = self.args.global_batch_size
                 use_dynamic_global_batch_size = bool(
                     getattr(self.args, "use_dynamic_global_batch_size", False)
                     or getattr(self.args, "use_dynamic_batch_size", False)
                 )
+                self._train_step_boundaries = None
+                self._train_step_token_counts = None
+                self._train_step_num_samples = None
+                self._train_step_long_sample_counts = None
+                self._train_step_token_budget = None
+                self._train_oversize_samples_dropped = 0
+                self._train_underfilled_steps = 0
+                self._train_long_samples_trimmed = 0
+                self._train_density_restricted_steps = 0
                 if use_dynamic_global_batch_size:
                     logger.info(f"Collected {len(data)} samples from rollout to train with dynamic global batch size")
-                    # TODO: this is a temporary solution, we should directly save dynamic_global_batch_size to rollout data
                     self._dynamic_global_batch_size = self._compute_dynamic_global_batch_size(len(data))
                     global_batch_size = self._dynamic_global_batch_size
 
-                max_samples_per_rollout = resolve_max_samples_per_rollout(global_batch_size)
-                trim_len = compute_train_trim_length(len(data), global_batch_size, max_samples_per_rollout)
-                if trim_len != len(data):
-                    if trim_len == 0:
-                        raise ValueError(f"Not enough samples {len(data)} for global_batch_size {global_batch_size}")
-                    origin_data_length = len(data)
-                    data = data[:trim_len]
-                    logger.info(
-                        f"trim number of samples from {origin_data_length} to {trim_len} "
-                        f"(global_batch_size={global_batch_size}, train_steps={trim_len // global_batch_size})"
-                    )
-                logger.info(
-                    f"Final collected {len(data)} samples from rollout to train "
-                    f"(global_batch_size={global_batch_size}, train_steps={len(data) // global_batch_size})"
+                token_budget = int(os.environ.get("TRAIN_STEP_TOKEN_BUDGET", "0") or "0")
+                underfilled_min_samples = int(os.environ.get("TRAIN_UNDERFILLED_STEP_MIN_SAMPLES", "4") or "4")
+                packing_strategy = os.environ.get("TRAIN_STEP_PACKING_STRATEGY", "greedy_desc")
+                long_sample_threshold = int(
+                    os.environ.get("TRAIN_STEP_LONG_SAMPLE_THRESHOLD", str(max(1, int(token_budget * 0.35)))) or "0"
                 )
+                max_long_samples_per_step = int(
+                    os.environ.get("TRAIN_MAX_LONG_SAMPLES_PER_STEP", "2") or "2"
+                )
+                dp_size = self.train_parallel_config["dp_size"]
+
+                if token_budget > 0 and dp_size == 1:
+                    configured_min = int(
+                        os.environ.get(
+                            "TRAIN_MIN_DYNAMIC_GLOBAL_BATCH_SIZE",
+                            str(max(dp_size, global_batch_size // 2)),
+                        )
+                        or "0"
+                    )
+                    max_samples_per_rollout = resolve_max_samples_per_rollout(global_batch_size)
+                    step_plan = plan_train_steps_by_token_budget(
+                        data,
+                        max_samples_per_step=global_batch_size,
+                        min_samples_per_step=configured_min,
+                        underfilled_min_samples=underfilled_min_samples,
+                        step_token_budget=token_budget,
+                        max_samples_per_rollout=max_samples_per_rollout,
+                        packing_strategy=packing_strategy,
+                        long_sample_threshold=long_sample_threshold,
+                        max_long_samples_per_step=max_long_samples_per_step,
+                    )
+                    if not step_plan.retained_indices:
+                        raise ValueError(
+                            "Token-budget planning retained no trainable samples "
+                            f"(num_samples={len(data)}, token_budget={token_budget})"
+                        )
+                    data = [data[index] for index in step_plan.retained_indices]
+                    self._dynamic_global_batch_size = step_plan.dynamic_global_batch_size or global_batch_size
+                    self._train_step_boundaries = step_plan.step_boundaries
+                    self._train_step_token_counts = step_plan.step_token_counts
+                    self._train_step_num_samples = step_plan.step_num_samples
+                    self._train_step_long_sample_counts = step_plan.step_long_sample_counts
+                    self._train_step_token_budget = token_budget
+                    self._train_oversize_samples_dropped = step_plan.oversize_samples_dropped
+                    self._train_underfilled_steps = step_plan.underfilled_steps
+                    self._train_long_samples_trimmed = step_plan.long_samples_trimmed
+                    self._train_density_restricted_steps = step_plan.density_restricted_steps
+                    if metrics is None:
+                        metrics = {}
+                    metrics.update(
+                        {
+                            "scheduler/runtime_requested_tokens": float(step_plan.requested_tokens),
+                            "scheduler/runtime_retained_tokens": float(step_plan.retained_tokens),
+                            "scheduler/runtime_trimmed_tokens": float(step_plan.trimmed_tokens),
+                            "train/step_token_budget": float(token_budget),
+                            "train/actual_step_token_mean": (
+                                float(np.mean(step_plan.step_token_counts)) if step_plan.step_token_counts else 0.0
+                            ),
+                            "train/actual_step_token_max": float(max(step_plan.step_token_counts, default=0)),
+                            "train/step_long_sample_mean": (
+                                float(np.mean(step_plan.step_long_sample_counts))
+                                if step_plan.step_long_sample_counts
+                                else 0.0
+                            ),
+                            "train/step_long_sample_max": float(max(step_plan.step_long_sample_counts, default=0)),
+                            "train/underfilled_steps": float(step_plan.underfilled_steps),
+                            "train/oversize_samples_dropped": float(step_plan.oversize_samples_dropped),
+                            "train/long_samples_trimmed": float(step_plan.long_samples_trimmed),
+                            "train/density_restricted_steps": float(step_plan.density_restricted_steps),
+                        }
+                    )
+                    logger.info(
+                        "Planned train steps by token budget: "
+                        f"samples={requested_samples}, retained={len(step_plan.retained_indices)}, "
+                        f"steps={len(step_plan.step_num_samples)}, "
+                        f"max_step_tokens={max(step_plan.step_token_counts, default=0)}, "
+                        f"mean_step_tokens={np.mean(step_plan.step_token_counts) if step_plan.step_token_counts else 0:.2f}, "
+                        f"step_sizes={step_plan.step_num_samples}, "
+                        f"long_step_counts={step_plan.step_long_sample_counts}"
+                    )
+                else:
+                    if token_budget > 0 and dp_size > 1:
+                        logger.warning(
+                            "TRAIN_STEP_TOKEN_BUDGET is set, but dp_size=%s > 1. "
+                            "Falling back to legacy sample-count trimming for this rollout.",
+                            dp_size,
+                        )
+                    max_samples_per_rollout = resolve_max_samples_per_rollout(global_batch_size)
+                    trim_len = compute_train_trim_length(len(data), global_batch_size, max_samples_per_rollout)
+                    if trim_len != len(data):
+                        if trim_len == 0:
+                            raise ValueError(f"Not enough samples {len(data)} for global_batch_size {global_batch_size}")
+                        origin_data_length = len(data)
+                        data = data[:trim_len]
+                        logger.info(
+                            f"trim number of samples from {origin_data_length} to {trim_len} "
+                            f"(global_batch_size={global_batch_size}, train_steps={trim_len // global_batch_size})"
+                        )
+                    logger.info(
+                        f"Final collected {len(data)} samples from rollout to train "
+                        f"(global_batch_size={global_batch_size}, train_steps={len(data) // global_batch_size})"
+                    )
 
         return data, metrics
 
@@ -649,6 +759,15 @@ class RolloutManager:
             # Too few samples, use at least dp_size
             dynamic_gbs = dp_size
             logger.warning(f"num_samples={num_samples} < dp_size={dp_size}, using dp_size as global_batch_size")
+
+        token_budget = int(os.environ.get("TRAIN_STEP_TOKEN_BUDGET", "0") or "0")
+        if token_budget > 0 and dp_size == 1:
+            if dynamic_gbs != original_gbs:
+                logger.info(
+                    f"Dynamic global_batch_size upper bound: {original_gbs} -> {dynamic_gbs} "
+                    f"(num_samples={num_samples}, token_budget={token_budget})"
+                )
+            return dynamic_gbs
 
         max_samples_per_rollout = resolve_max_samples_per_rollout(dynamic_gbs)
         retained = compute_train_trim_length(num_samples, dynamic_gbs, max_samples_per_rollout)
@@ -827,6 +946,16 @@ class RolloutManager:
             # Pass dynamic global_batch_size to training side
             if hasattr(self, "_dynamic_global_batch_size"):
                 rollout_data["dynamic_global_batch_size"] = self._dynamic_global_batch_size
+            if getattr(self, "_train_step_boundaries", None) is not None and dp_size == 1:
+                rollout_data["train_step_boundaries"] = list(self._train_step_boundaries)
+                rollout_data["train_step_token_counts"] = list(self._train_step_token_counts or [])
+                rollout_data["train_step_num_samples"] = list(self._train_step_num_samples or [])
+                rollout_data["train_step_long_sample_counts"] = list(self._train_step_long_sample_counts or [])
+                rollout_data["train_step_token_budget"] = self._train_step_token_budget
+                rollout_data["train_oversize_samples_dropped"] = self._train_oversize_samples_dropped
+                rollout_data["train_underfilled_steps"] = self._train_underfilled_steps
+                rollout_data["train_long_samples_trimmed"] = self._train_long_samples_trimmed
+                rollout_data["train_density_restricted_steps"] = self._train_density_restricted_steps
             rollout_data_refs.append(Box(ray.put(rollout_data)))
         return rollout_data_refs
 
