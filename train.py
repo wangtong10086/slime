@@ -4,6 +4,7 @@ import ray
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
+from slime.utils.checkpoint_retention import prune_training_checkpoints
 from slime.utils.logging_utils import configure_logger, init_tracking, finish_tracking
 from slime.utils.misc import should_run_periodic_action
 
@@ -74,6 +75,19 @@ def train(args):
             )
         if args.rollout_global_dataset:
             ray.get(rollout_manager.save.remote(rollout_id))
+
+        retention = prune_training_checkpoints(
+            args.save,
+            save_hf_template=getattr(args, "save_hf", None),
+            keep_latest_complete=1,
+        )
+        if retention["removed_incomplete"] or retention["removed_old_full"]:
+            print(
+                "[train] checkpoint retention pruned "
+                f"incomplete={len(retention['removed_incomplete'])} "
+                f"old_full={len(retention['removed_old_full'])}",
+                flush=True,
+            )
 
     # train loop.
     # note that for async training, one can change the position of the sync operation(ray.get).
