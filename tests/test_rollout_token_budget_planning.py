@@ -14,7 +14,11 @@ sys.modules["megatron.core.packed_seq_params"] = fake_packed_seq_params
 sys.modules.setdefault("wandb", types.SimpleNamespace())
 
 from slime.backends.megatron_utils import data as megatron_data
-from slime.ray.rollout_batching import plan_train_steps_by_token_budget
+from slime.ray.rollout_batching import (
+    compute_sample_logit_cost,
+    compute_windowed_sample_token_cost,
+    plan_train_steps_by_token_budget,
+)
 
 
 class _FakeMpu:
@@ -108,6 +112,49 @@ def test_plan_train_steps_drops_oversize_samples():
     assert 0 not in plan.retained_indices
     assert max(plan.step_token_counts) <= 48000
     assert plan.long_samples_trimmed >= 1
+
+
+def test_plan_train_steps_respects_logit_budget_and_single_sample_limit():
+    samples = [
+        {"tokens": list(range(20000)), "response_length": 12000, "loss_mask": [1] * 12000},
+        {"tokens": list(range(18000)), "response_length": 9000, "loss_mask": [1] * 9000},
+        {"tokens": list(range(14000)), "response_length": 7000, "loss_mask": [1] * 7000},
+        {"tokens": list(range(12000)), "response_length": 6000, "loss_mask": [1] * 6000},
+    ]
+
+    plan = plan_train_steps_by_token_budget(
+        samples,
+        max_samples_per_step=8,
+        min_samples_per_step=2,
+        underfilled_min_samples=2,
+        step_token_budget=48000,
+        step_logit_budget=12000,
+        max_single_sample_tokens_per_step=12000,
+        max_single_sample_logit_tokens=8000,
+        max_total_tokens_per_sample=4096,
+        max_response_tokens_per_sample=2048,
+    )
+
+    assert max(plan.step_logit_counts) <= 12000
+    assert plan.oversize_logit_samples_dropped == 0
+
+
+def test_windowed_sample_costs_reflect_training_caps():
+    sample = {
+        "tokens": list(range(10000)),
+        "response_length": 6000,
+        "loss_mask": [1] * 6000,
+    }
+
+    assert compute_sample_logit_cost(sample, max_response_tokens_per_sample=2048) == 2048
+    assert (
+        compute_windowed_sample_token_cost(
+            sample,
+            max_total_tokens_per_sample=4096,
+            max_response_tokens_per_sample=2048,
+        )
+        == 4096
+    )
 
 
 def test_get_data_iterator_uses_explicit_train_step_boundaries(monkeypatch):

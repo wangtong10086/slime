@@ -15,9 +15,14 @@ class StepPlan:
     retained_tokens: int
     trimmed_tokens: int
     oversize_samples_dropped: int
+    oversize_logit_samples_dropped: int
     underfilled_steps: int
     long_samples_trimmed: int
     density_restricted_steps: int
+    requested_logit_tokens: int
+    retained_logit_tokens: int
+    trimmed_logit_tokens: int
+    step_logit_counts: list[int]
 
 
 def compute_sample_token_cost(sample: Any) -> int:
@@ -38,6 +43,43 @@ def compute_sample_token_cost(sample: Any) -> int:
         return len(tokens)
 
     raise ValueError(f"Cannot infer token cost from sample of type {type(sample)!r}")
+
+
+def compute_sample_logit_cost(sample: Any, max_response_tokens_per_sample: int | None = None) -> int:
+    if isinstance(sample, dict):
+        loss_mask = sample.get("loss_mask") or sample.get("loss_masks")
+        if isinstance(loss_mask, list):
+            response_length = sum(loss_mask)
+        else:
+            response_length = sample.get("response_length")
+            if response_length is None and sample.get("tokens") is not None:
+                response_length = len(sample["tokens"])
+    else:
+        response_length = getattr(sample, "effective_response_length", None)
+        if response_length is None:
+            response_length = getattr(sample, "response_length", None)
+
+    if not isinstance(response_length, int) or response_length < 0:
+        raise ValueError(f"Cannot infer logit cost from sample of type {type(sample)!r}")
+
+    if max_response_tokens_per_sample and max_response_tokens_per_sample > 0:
+        response_length = min(response_length, max_response_tokens_per_sample)
+    return response_length
+
+
+def compute_windowed_sample_token_cost(
+    sample: Any,
+    *,
+    max_total_tokens_per_sample: int | None = None,
+    max_response_tokens_per_sample: int | None = None,
+) -> int:
+    total_tokens = compute_sample_token_cost(sample)
+    response_tokens = compute_sample_logit_cost(sample, max_response_tokens_per_sample=max_response_tokens_per_sample)
+    prompt_tokens = max(0, total_tokens - compute_sample_logit_cost(sample, max_response_tokens_per_sample=None))
+    windowed_total = prompt_tokens + response_tokens
+    if max_total_tokens_per_sample and max_total_tokens_per_sample > 0:
+        windowed_total = min(windowed_total, max_total_tokens_per_sample)
+    return max(response_tokens, windowed_total)
 
 
 def choose_dynamic_global_batch_size(
@@ -113,6 +155,10 @@ def plan_train_steps_by_token_budget(
     long_sample_threshold: int | None = None,
     max_long_samples_per_step: int | None = None,
     max_single_sample_tokens_per_step: int | None = None,
+    step_logit_budget: int | None = None,
+    max_single_sample_logit_tokens: int | None = None,
+    max_total_tokens_per_sample: int | None = None,
+    max_response_tokens_per_sample: int | None = None,
 ) -> StepPlan:
     if packing_strategy != "greedy_desc":
         raise ValueError(f"Unsupported packing strategy: {packing_strategy}")
@@ -126,45 +172,77 @@ def plan_train_steps_by_token_budget(
         max_long_samples_per_step = max_samples_per_step
     if max_single_sample_tokens_per_step is None or max_single_sample_tokens_per_step <= 0:
         max_single_sample_tokens_per_step = step_token_budget
+    if step_logit_budget is None or step_logit_budget <= 0:
+        step_logit_budget = step_token_budget
+    if max_single_sample_logit_tokens is None or max_single_sample_logit_tokens <= 0:
+        max_single_sample_logit_tokens = step_logit_budget
 
-    sample_costs = [compute_sample_token_cost(sample) for sample in samples]
+    sample_costs = [
+        compute_windowed_sample_token_cost(
+            sample,
+            max_total_tokens_per_sample=max_total_tokens_per_sample,
+            max_response_tokens_per_sample=max_response_tokens_per_sample,
+        )
+        for sample in samples
+    ]
+    sample_logit_costs = [
+        compute_sample_logit_cost(sample, max_response_tokens_per_sample=max_response_tokens_per_sample)
+        for sample in samples
+    ]
     requested_tokens = sum(sample_costs)
+    requested_logit_tokens = sum(sample_logit_costs)
 
-    kept_items: list[tuple[int, int]] = []
+    kept_items: list[tuple[int, int, int]] = []
     trimmed_tokens = 0
+    trimmed_logit_tokens = 0
     oversize_samples_dropped = 0
+    oversize_logit_samples_dropped = 0
     long_samples_trimmed = 0
-    for index, cost in enumerate(sample_costs):
+    for index, (cost, logit_cost) in enumerate(zip(sample_costs, sample_logit_costs, strict=True)):
         is_long = cost >= long_sample_threshold
-        if cost > step_token_budget or cost > max_single_sample_tokens_per_step:
-            oversize_samples_dropped += 1
+        if (
+            cost > step_token_budget
+            or cost > max_single_sample_tokens_per_step
+            or logit_cost > step_logit_budget
+            or logit_cost > max_single_sample_logit_tokens
+        ):
+            if cost > step_token_budget or cost > max_single_sample_tokens_per_step:
+                oversize_samples_dropped += 1
+            if logit_cost > step_logit_budget or logit_cost > max_single_sample_logit_tokens:
+                oversize_logit_samples_dropped += 1
             trimmed_tokens += cost
+            trimmed_logit_tokens += logit_cost
             if is_long:
                 long_samples_trimmed += 1
             continue
-        kept_items.append((index, cost))
+        kept_items.append((index, cost, logit_cost))
 
-    kept_items.sort(key=lambda item: (-item[1], item[0]))
+    kept_items.sort(key=lambda item: (-item[2], -item[1], item[0]))
     bins: list[dict[str, list[int] | int]] = []
     density_restricted_steps = 0
-    for index, cost in kept_items:
+    for index, cost, logit_cost in kept_items:
         is_long = cost >= long_sample_threshold
         placed = False
         feasible_bins: list[tuple[int, int]] = []
         density_restricted = False
         for bin_idx, current in enumerate(bins):
             current_tokens = int(current["tokens"])
+            current_logit_tokens = int(current["logit_tokens"])
             current_indices = current["indices"]
             assert isinstance(current_indices, list)
             if len(current_indices) >= max_samples_per_step:
                 continue
             if current_tokens + cost > step_token_budget:
                 continue
+            if current_logit_tokens + logit_cost > step_logit_budget:
+                continue
             current_long_count = int(current["long_samples"])
             if is_long and current_long_count + 1 > max_long_samples_per_step:
                 density_restricted = True
                 continue
-            feasible_bins.append((step_token_budget - (current_tokens + cost), bin_idx))
+            token_slack = step_token_budget - (current_tokens + cost)
+            logit_slack = step_logit_budget - (current_logit_tokens + logit_cost)
+            feasible_bins.append((max(token_slack, logit_slack), bin_idx))
         if feasible_bins:
             _, chosen_idx = min(feasible_bins, key=lambda item: item[0])
             current = bins[chosen_idx]
@@ -172,13 +250,21 @@ def plan_train_steps_by_token_budget(
             assert isinstance(current_indices, list)
             current_indices.append(index)
             current["tokens"] = int(current["tokens"]) + cost
+            current["logit_tokens"] = int(current["logit_tokens"]) + logit_cost
             if is_long:
                 current["long_samples"] = int(current["long_samples"]) + 1
             placed = True
         if density_restricted and not placed:
             density_restricted_steps += 1
         if not placed:
-            bins.append({"indices": [index], "tokens": cost, "long_samples": 1 if is_long else 0})
+            bins.append(
+                {
+                    "indices": [index],
+                    "tokens": cost,
+                    "logit_tokens": logit_cost,
+                    "long_samples": 1 if is_long else 0,
+                }
+            )
 
     if max_samples_per_rollout is not None and max_samples_per_rollout > 0:
         capped_bins: list[dict[str, list[int] | int]] = []
@@ -189,6 +275,7 @@ def plan_train_steps_by_token_budget(
             current_count = len(current_indices)
             if retained_so_far + current_count > max_samples_per_rollout:
                 trimmed_tokens += int(current["tokens"])
+                trimmed_logit_tokens += int(current["logit_tokens"])
                 long_samples_trimmed += int(current["long_samples"])
                 continue
             capped_bins.append(current)
@@ -203,6 +290,7 @@ def plan_train_steps_by_token_budget(
         current_count = len(current_indices)
         if current_count < underfilled_min_samples and len(bins) > 1:
             trimmed_tokens += int(current["tokens"])
+            trimmed_logit_tokens += int(current["logit_tokens"])
             long_samples_trimmed += int(current["long_samples"])
             continue
         if current_count < min_samples_per_step:
@@ -214,18 +302,23 @@ def plan_train_steps_by_token_budget(
     step_token_counts: list[int] = []
     step_num_samples: list[int] = []
     step_long_sample_counts: list[int] = []
+    step_logit_counts: list[int] = []
     retained_tokens = 0
+    retained_logit_tokens = 0
     for current in kept_bins:
         current_indices = current["indices"]
         assert isinstance(current_indices, list)
         retained_indices.extend(current_indices)
         retained_tokens += int(current["tokens"])
+        retained_logit_tokens += int(current["logit_tokens"])
         step_token_counts.append(int(current["tokens"]))
+        step_logit_counts.append(int(current["logit_tokens"]))
         step_num_samples.append(len(current_indices))
         step_long_sample_counts.append(int(current["long_samples"]))
         step_boundaries.append(len(retained_indices))
 
     trimmed_tokens = requested_tokens - retained_tokens
+    trimmed_logit_tokens = requested_logit_tokens - retained_logit_tokens
     dynamic_global_batch_size = max(step_num_samples, default=0)
 
     return StepPlan(
@@ -239,7 +332,12 @@ def plan_train_steps_by_token_budget(
         retained_tokens=retained_tokens,
         trimmed_tokens=trimmed_tokens,
         oversize_samples_dropped=oversize_samples_dropped,
+        oversize_logit_samples_dropped=oversize_logit_samples_dropped,
         underfilled_steps=underfilled_steps,
         long_samples_trimmed=long_samples_trimmed,
         density_restricted_steps=density_restricted_steps,
+        requested_logit_tokens=requested_logit_tokens,
+        retained_logit_tokens=retained_logit_tokens,
+        trimmed_logit_tokens=trimmed_logit_tokens,
+        step_logit_counts=step_logit_counts,
     )

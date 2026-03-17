@@ -581,10 +581,15 @@ class RolloutManager:
         self._train_step_num_samples = None
         self._train_step_long_sample_counts = None
         self._train_step_token_budget = None
+        self._train_step_logit_budget = None
+        self._train_step_logit_counts = None
         self._train_oversize_samples_dropped = 0
+        self._train_oversize_logit_samples_dropped = 0
         self._train_underfilled_steps = 0
         self._train_long_samples_trimmed = 0
         self._train_density_restricted_steps = 0
+        self._train_windowed_samples = 0
+        self._train_windowed_token_trim = 0
         if self.args.load_debug_rollout_data:
             data = torch.load(
                 self.args.load_debug_rollout_data.format(rollout_id=rollout_id),
@@ -619,16 +624,22 @@ class RolloutManager:
                 self._train_step_num_samples = None
                 self._train_step_long_sample_counts = None
                 self._train_step_token_budget = None
+                self._train_step_logit_budget = None
+                self._train_step_logit_counts = None
                 self._train_oversize_samples_dropped = 0
+                self._train_oversize_logit_samples_dropped = 0
                 self._train_underfilled_steps = 0
                 self._train_long_samples_trimmed = 0
                 self._train_density_restricted_steps = 0
+                self._train_windowed_samples = 0
+                self._train_windowed_token_trim = 0
                 if use_dynamic_global_batch_size:
                     logger.info(f"Collected {len(data)} samples from rollout to train with dynamic global batch size")
                     self._dynamic_global_batch_size = self._compute_dynamic_global_batch_size(len(data))
                     global_batch_size = self._dynamic_global_batch_size
 
                 token_budget = int(os.environ.get("TRAIN_STEP_TOKEN_BUDGET", "0") or "0")
+                logit_budget = int(os.environ.get("TRAIN_STEP_LOGIT_BUDGET", "0") or "0")
                 underfilled_min_samples = int(os.environ.get("TRAIN_UNDERFILLED_STEP_MIN_SAMPLES", "4") or "4")
                 packing_strategy = os.environ.get("TRAIN_STEP_PACKING_STRATEGY", "greedy_desc")
                 long_sample_threshold = int(
@@ -636,6 +647,13 @@ class RolloutManager:
                 )
                 max_long_samples_per_step = int(
                     os.environ.get("TRAIN_MAX_LONG_SAMPLES_PER_STEP", "2") or "2"
+                )
+                max_single_sample_tokens = int(os.environ.get("TRAIN_MAX_SINGLE_SAMPLE_TOKENS", "12000") or "12000")
+                max_total_tokens_per_sample = int(
+                    os.environ.get("TRAIN_MAX_TOTAL_TOKENS_PER_SAMPLE", "4096") or "4096"
+                )
+                max_response_tokens_per_sample = int(
+                    os.environ.get("TRAIN_MAX_RESPONSE_TOKENS_PER_SAMPLE", "2048") or "2048"
                 )
                 dp_size = self.train_parallel_config["dp_size"]
 
@@ -658,6 +676,11 @@ class RolloutManager:
                         packing_strategy=packing_strategy,
                         long_sample_threshold=long_sample_threshold,
                         max_long_samples_per_step=max_long_samples_per_step,
+                        max_single_sample_tokens_per_step=max_single_sample_tokens,
+                        step_logit_budget=logit_budget,
+                        max_single_sample_logit_tokens=max_response_tokens_per_sample,
+                        max_total_tokens_per_sample=max_total_tokens_per_sample,
+                        max_response_tokens_per_sample=max_response_tokens_per_sample,
                     )
                     if not step_plan.retained_indices:
                         raise ValueError(
@@ -671,7 +694,10 @@ class RolloutManager:
                     self._train_step_num_samples = step_plan.step_num_samples
                     self._train_step_long_sample_counts = step_plan.step_long_sample_counts
                     self._train_step_token_budget = token_budget
+                    self._train_step_logit_budget = logit_budget
+                    self._train_step_logit_counts = step_plan.step_logit_counts
                     self._train_oversize_samples_dropped = step_plan.oversize_samples_dropped
+                    self._train_oversize_logit_samples_dropped = step_plan.oversize_logit_samples_dropped
                     self._train_underfilled_steps = step_plan.underfilled_steps
                     self._train_long_samples_trimmed = step_plan.long_samples_trimmed
                     self._train_density_restricted_steps = step_plan.density_restricted_steps
@@ -682,11 +708,19 @@ class RolloutManager:
                             "scheduler/runtime_requested_tokens": float(step_plan.requested_tokens),
                             "scheduler/runtime_retained_tokens": float(step_plan.retained_tokens),
                             "scheduler/runtime_trimmed_tokens": float(step_plan.trimmed_tokens),
+                            "scheduler/runtime_requested_logit_tokens": float(step_plan.requested_logit_tokens),
+                            "scheduler/runtime_retained_logit_tokens": float(step_plan.retained_logit_tokens),
+                            "scheduler/runtime_trimmed_logit_tokens": float(step_plan.trimmed_logit_tokens),
                             "train/step_token_budget": float(token_budget),
+                            "train/step_logit_budget": float(logit_budget),
                             "train/actual_step_token_mean": (
                                 float(np.mean(step_plan.step_token_counts)) if step_plan.step_token_counts else 0.0
                             ),
                             "train/actual_step_token_max": float(max(step_plan.step_token_counts, default=0)),
+                            "train/actual_step_logit_mean": (
+                                float(np.mean(step_plan.step_logit_counts)) if step_plan.step_logit_counts else 0.0
+                            ),
+                            "train/actual_step_logit_max": float(max(step_plan.step_logit_counts, default=0)),
                             "train/step_long_sample_mean": (
                                 float(np.mean(step_plan.step_long_sample_counts))
                                 if step_plan.step_long_sample_counts
@@ -695,6 +729,7 @@ class RolloutManager:
                             "train/step_long_sample_max": float(max(step_plan.step_long_sample_counts, default=0)),
                             "train/underfilled_steps": float(step_plan.underfilled_steps),
                             "train/oversize_samples_dropped": float(step_plan.oversize_samples_dropped),
+                            "train/oversize_logit_samples_dropped": float(step_plan.oversize_logit_samples_dropped),
                             "train/long_samples_trimmed": float(step_plan.long_samples_trimmed),
                             "train/density_restricted_steps": float(step_plan.density_restricted_steps),
                         }
@@ -705,6 +740,7 @@ class RolloutManager:
                         f"steps={len(step_plan.step_num_samples)}, "
                         f"max_step_tokens={max(step_plan.step_token_counts, default=0)}, "
                         f"mean_step_tokens={np.mean(step_plan.step_token_counts) if step_plan.step_token_counts else 0:.2f}, "
+                        f"max_step_logit_tokens={max(step_plan.step_logit_counts, default=0)}, "
                         f"step_sizes={step_plan.step_num_samples}, "
                         f"long_step_counts={step_plan.step_long_sample_counts}"
                     )
@@ -840,9 +876,56 @@ class RolloutManager:
         assert len(raw_rewards) == len(samples)
         assert len(rewards) == len(samples)
 
+        max_total_tokens_per_sample = int(os.environ.get("TRAIN_MAX_TOTAL_TOKENS_PER_SAMPLE", "0") or "0")
+        max_response_tokens_per_sample = int(os.environ.get("TRAIN_MAX_RESPONSE_TOKENS_PER_SAMPLE", "0") or "0")
+        window_policy = os.environ.get("TRAIN_SAMPLE_WINDOW_POLICY", "tail_response")
+
+        def _window_sample(sample: Sample) -> tuple[list[int], int, list[int], int]:
+            tokens = sample.tokens
+            response_length = sample.response_length
+            loss_mask = sample.loss_mask if sample.loss_mask is not None else [1] * response_length
+
+            if not max_total_tokens_per_sample and not max_response_tokens_per_sample:
+                return tokens, response_length, loss_mask, 0
+
+            prompt_length = max(0, len(tokens) - response_length)
+            keep_response = response_length
+            if max_response_tokens_per_sample > 0:
+                keep_response = min(keep_response, max_response_tokens_per_sample)
+
+            if window_policy != "tail_response":
+                raise ValueError(f"Unsupported TRAIN_SAMPLE_WINDOW_POLICY={window_policy}")
+
+            prompt_budget = max_total_tokens_per_sample - keep_response if max_total_tokens_per_sample > 0 else prompt_length
+            prompt_budget = max(prompt_budget, 0)
+            keep_prompt = min(prompt_length, prompt_budget)
+
+            kept_tokens = tokens[prompt_length - keep_prompt : prompt_length] + tokens[-keep_response:]
+            kept_loss_mask = loss_mask[-keep_response:]
+            trimmed = len(tokens) - len(kept_tokens)
+            return kept_tokens, keep_response, kept_loss_mask, trimmed
+
+        train_tokens = []
+        train_response_lengths = []
+        windowed_loss_masks = []
+        windowed_samples = 0
+        windowed_token_trim = 0
+
+        for sample in samples:
+            kept_tokens, kept_response_length, kept_loss_mask, trimmed = _window_sample(sample)
+            train_tokens.append(kept_tokens)
+            train_response_lengths.append(kept_response_length)
+            windowed_loss_masks.append(kept_loss_mask)
+            if trimmed > 0:
+                windowed_samples += 1
+                windowed_token_trim += trimmed
+
+        self._train_windowed_samples = windowed_samples
+        self._train_windowed_token_trim = windowed_token_trim
+
         train_data = {
-            "tokens": [sample.tokens for sample in samples],
-            "response_lengths": [sample.response_length for sample in samples],
+            "tokens": train_tokens,
+            "response_lengths": train_response_lengths,
             # some reward model, e.g. remote rm, may return multiple rewards,
             # we could use key to select the reward.
             "rewards": rewards,
@@ -854,17 +937,15 @@ class RolloutManager:
         # loss mask
         # TODO: compress the loss mask
         loss_masks = []
-        for sample in samples:
-            # always instantiate loss_mask if not provided
-            if sample.loss_mask is None:
-                sample.loss_mask = [1] * sample.response_length
-
-            assert (
-                len(sample.loss_mask) == sample.response_length
-            ), f"loss mask length {len(sample.loss_mask)} != response length {sample.response_length}"
+        for sample, kept_loss_mask, kept_response_length in zip(
+            samples, windowed_loss_masks, train_response_lengths, strict=True
+        ):
+            assert len(kept_loss_mask) == kept_response_length, (
+                f"loss mask length {len(kept_loss_mask)} != response length {kept_response_length}"
+            )
             if sample.remove_sample:
-                sample.loss_mask = [0] * sample.response_length
-            loss_masks.append(sample.loss_mask)
+                kept_loss_mask = [0] * kept_response_length
+            loss_masks.append(kept_loss_mask)
         train_data["loss_masks"] = loss_masks
 
         # overwriting the raw reward
@@ -952,10 +1033,15 @@ class RolloutManager:
                 rollout_data["train_step_num_samples"] = list(self._train_step_num_samples or [])
                 rollout_data["train_step_long_sample_counts"] = list(self._train_step_long_sample_counts or [])
                 rollout_data["train_step_token_budget"] = self._train_step_token_budget
+                rollout_data["train_step_logit_budget"] = self._train_step_logit_budget
+                rollout_data["train_step_logit_counts"] = list(self._train_step_logit_counts or [])
                 rollout_data["train_oversize_samples_dropped"] = self._train_oversize_samples_dropped
+                rollout_data["train_oversize_logit_samples_dropped"] = self._train_oversize_logit_samples_dropped
                 rollout_data["train_underfilled_steps"] = self._train_underfilled_steps
                 rollout_data["train_long_samples_trimmed"] = self._train_long_samples_trimmed
                 rollout_data["train_density_restricted_steps"] = self._train_density_restricted_steps
+                rollout_data["train_windowed_samples"] = self._train_windowed_samples
+                rollout_data["train_windowed_token_trim"] = self._train_windowed_token_trim
             rollout_data_refs.append(Box(ray.put(rollout_data)))
         return rollout_data_refs
 

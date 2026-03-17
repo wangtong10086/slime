@@ -232,6 +232,7 @@ def forward_only(
             labels=None,
             packed_seq_params=packed_seq_params,
             loss_mask=batch["full_loss_masks"],
+            fp32_output=False,
             **(batch["multimodal_train_inputs"] if batch["multimodal_train_inputs"] is not None else {}),
         )
 
@@ -409,7 +410,7 @@ def train_one_step(
             if batch["multimodal_train_inputs"] is not None:
                 forward_kwargs.update(batch["multimodal_train_inputs"])
 
-            output_tensor = model(**forward_kwargs)
+            output_tensor = model(fp32_output=False, **forward_kwargs)
 
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
@@ -658,9 +659,17 @@ def train(
             rollout_step_token_counts = data_iterator[0].rollout_data.get("train_step_token_counts")
             if rollout_step_token_counts is not None:
                 log_dict["train/step_token_budget"] = data_iterator[0].rollout_data.get("train_step_token_budget", 0)
+                log_dict["train/step_logit_budget"] = data_iterator[0].rollout_data.get("train_step_logit_budget", 0)
                 log_dict["train/actual_step_token_mean"] = sum(rollout_step_token_counts) / len(rollout_step_token_counts)
                 log_dict["train/actual_step_token_max"] = max(rollout_step_token_counts)
                 log_dict["train/actual_step_tokens"] = rollout_step_token_counts[step_id]
+                rollout_step_logit_counts = data_iterator[0].rollout_data.get("train_step_logit_counts") or []
+                if rollout_step_logit_counts:
+                    log_dict["train/actual_step_logit_mean"] = sum(rollout_step_logit_counts) / len(
+                        rollout_step_logit_counts
+                    )
+                    log_dict["train/actual_step_logit_max"] = max(rollout_step_logit_counts)
+                    log_dict["train/actual_step_logit_tokens"] = rollout_step_logit_counts[step_id]
                 rollout_step_long_sample_counts = data_iterator[0].rollout_data.get("train_step_long_sample_counts") or []
                 if rollout_step_long_sample_counts:
                     log_dict["train/step_long_sample_mean"] = sum(rollout_step_long_sample_counts) / len(
@@ -672,11 +681,18 @@ def train(
                 log_dict["train/oversize_samples_dropped"] = data_iterator[0].rollout_data.get(
                     "train_oversize_samples_dropped", 0
                 )
+                log_dict["train/oversize_logit_samples_dropped"] = data_iterator[0].rollout_data.get(
+                    "train_oversize_logit_samples_dropped", 0
+                )
                 log_dict["train/long_samples_trimmed"] = data_iterator[0].rollout_data.get(
                     "train_long_samples_trimmed", 0
                 )
                 log_dict["train/density_restricted_steps"] = data_iterator[0].rollout_data.get(
                     "train_density_restricted_steps", 0
+                )
+                log_dict["train/windowed_samples"] = data_iterator[0].rollout_data.get("train_windowed_samples", 0)
+                log_dict["train/windowed_token_trim"] = data_iterator[0].rollout_data.get(
+                    "train_windowed_token_trim", 0
                 )
 
             if args.loss_type == "sft_loss":

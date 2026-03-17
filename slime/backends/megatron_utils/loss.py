@@ -66,7 +66,7 @@ def get_responses(
     """
     qkv_format = args.qkv_format
 
-    assert logits.dtype == torch.float32, f"{logits.dtype}"
+    assert logits.dtype in (torch.float32, torch.float16, torch.bfloat16), f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
 
     if qkv_format == "thd":
@@ -75,9 +75,6 @@ def get_responses(
     else:
         assert max_seq_lens is not None
         logits = logits.view(-1, logits.size(-1))
-
-    if args.rollout_temperature != 1.0:
-        logits = logits.div(args.rollout_temperature)
 
     cp_size = mpu.get_context_parallel_world_size()
     end = 0
@@ -275,6 +272,7 @@ def get_log_probs_and_entropy(
             mpu.get_tensor_model_parallel_group(),
             with_entropy=with_entropy,
             chunk_size=args.log_probs_chunk_size,
+            temperature=args.rollout_temperature,
         )
 
         log_probs_list.append(log_prob.squeeze(-1))
@@ -340,7 +338,7 @@ def get_values(
         max_seq_lens=max_seq_lens,
     ):
         assert logits_chunk.size(-1) == 1, f"{logits_chunk.shape}"
-        value_list.append(logits_chunk.squeeze(-1))
+        value_list.append(logits_chunk.float().squeeze(-1))
 
     res = {
         "values": value_list,

@@ -349,6 +349,7 @@ def get_data_iterator(
     num_local_gbs = global_batch_size // dp_size
     train_step_boundaries = rollout_data.get("train_step_boundaries")
     train_step_token_counts = rollout_data.get("train_step_token_counts")
+    train_step_logit_counts = rollout_data.get("train_step_logit_counts")
     train_step_num_samples = rollout_data.get("train_step_num_samples")
     train_step_long_sample_counts = rollout_data.get("train_step_long_sample_counts")
     if train_step_boundaries is not None:
@@ -365,6 +366,7 @@ def get_data_iterator(
         logger.info(
             "Using token-aware train step plan: "
             f"step_sizes={train_step_num_samples}, step_tokens={train_step_token_counts}, "
+            f"step_logit_tokens={train_step_logit_counts}, "
             f"step_long_samples={train_step_long_sample_counts}, "
             f"token_budget={rollout_data.get('train_step_token_budget')}"
         )
