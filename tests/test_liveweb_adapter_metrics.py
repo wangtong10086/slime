@@ -36,7 +36,18 @@ def test_liveweb_summarize_results_breaks_out_failure_types():
             reward=0.0,
             success=False,
             time_taken=1.0,
-            raw_result={"error": "", "extra": {"failure_reason": "parse_failed", "cache_stats": {}}},
+            raw_result={
+                "error": "",
+                "extra": {
+                    "failure_reason": "parse_failed",
+                    "cache_stats": {},
+                    "format_recovery_attempts": 2,
+                    "format_recovery_successes": 1,
+                    "format_recovery_exhausted": 1,
+                    "format_failure_recoverable_rate": 0.5,
+                    "format_failure_terminal_rate": 0.5,
+                },
+            },
         ),
     ]
     metrics = adapter.summarize_results(results, "env")
@@ -46,3 +57,9 @@ def test_liveweb_summarize_results_breaks_out_failure_types():
     assert metrics["env/domain_unreachable_rate"] == 1 / 3
     assert metrics["env/prefetch_failure_rate"] == 1 / 3
     assert metrics["env/invalid_tool_format_rate"] == 1 / 3
+    assert metrics["env/format_recovery_attempts"] == 2
+    assert metrics["env/format_recovery_successes"] == 1
+    assert metrics["env/format_recovery_exhausted"] == 1
+    assert metrics["env/format_recovery_success_rate"] == 0.5
+    assert metrics["env/format_failure_recoverable_rate"] == 1 / 6
+    assert metrics["env/format_failure_terminal_rate"] == 1 / 6

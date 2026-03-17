@@ -639,6 +639,13 @@ class LiveWebRolloutState:
         self.runtime_pool_hits += 1
 
 
+def format_recovery_extra(agent_loop: Any | None) -> dict[str, Any]:
+    if agent_loop is None or not hasattr(agent_loop, "get_format_recovery_stats"):
+        return {}
+    stats = agent_loop.get_format_recovery_stats()
+    return stats if isinstance(stats, dict) else {}
+
+
 def _should_bypass_proxy(base_url: str) -> bool:
     try:
         hostname = (urlparse(base_url).hostname or "").strip()
@@ -744,7 +751,7 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
                     os.getenv("LIVEWEB_TEMPERATURE", "0.7"),
                 )
             )
-            trajectory, final_answer, usage, failure_reason, error_message, _ = await actor._run_agent_loop(
+            trajectory, final_answer, usage, failure_reason, error_message, agent_loop = await actor._run_agent_loop(
                 task=task,
                 session=session,
                 llm_client=agent_llm_client,
@@ -887,6 +894,7 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
                     "browser_rebuild_count": state.browser_rebuild_count,
                     "browser_reuse_failures": state.browser_reuse_failures,
                     "browser_recovery_success_count": state.browser_recovery_success_count,
+                    **format_recovery_extra(agent_loop),
                 },
                 "rewards": {
                     "step_rewards": step_rewards,

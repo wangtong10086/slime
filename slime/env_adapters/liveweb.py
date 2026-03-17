@@ -289,6 +289,27 @@ class LiveWebEnvironmentAdapter(EnvironmentAdapter):
         metrics["env/invalid_tool_format_rate"] = _rate(
             lambda item: self._classify_environment_failure_type(item.raw_result) == "invalid_tool_format"
         )
+        attempts = sum(float((item.raw_result.get("extra") or {}).get("format_recovery_attempts", 0)) for item in results)
+        successes = sum(float((item.raw_result.get("extra") or {}).get("format_recovery_successes", 0)) for item in results)
+        exhausted = sum(float((item.raw_result.get("extra") or {}).get("format_recovery_exhausted", 0)) for item in results)
+        metrics["env/format_recovery_attempts"] = attempts
+        metrics["env/format_recovery_successes"] = successes
+        metrics["env/format_recovery_exhausted"] = exhausted
+        metrics["env/format_recovery_success_rate"] = (successes / attempts) if attempts else 0.0
+        recoverable_rates = [
+            float((item.raw_result.get("extra") or {}).get("format_failure_recoverable_rate", 0.0))
+            for item in results
+        ]
+        terminal_rates = [
+            float((item.raw_result.get("extra") or {}).get("format_failure_terminal_rate", 0.0))
+            for item in results
+        ]
+        metrics["env/format_failure_recoverable_rate"] = (
+            sum(recoverable_rates) / len(recoverable_rates) if recoverable_rates else 0.0
+        )
+        metrics["env/format_failure_terminal_rate"] = (
+            sum(terminal_rates) / len(terminal_rates) if terminal_rates else 0.0
+        )
         return metrics
 
     @staticmethod
