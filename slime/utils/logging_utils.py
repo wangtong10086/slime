@@ -25,6 +25,8 @@ def configure_logger(prefix: str = ""):
 
 
 def init_tracking(args, primary: bool = True, **kwargs):
+    if getattr(args, "use_wandb", False):
+        wandb_utils.ensure_wandb_service_teardown_patch_installed()
     if primary:
         wandb_utils.init_wandb_primary(args, **kwargs)
     else:
@@ -35,8 +37,14 @@ def finish_tracking(args):
     if not args.use_wandb:
         return
     try:
-        if wandb.run is not None:
-            wandb.finish()
+        wandb_utils.finish_wandb_once()
+    except (BrokenPipeError, ConnectionResetError) as exc:
+        logging.getLogger(__name__).debug("Ignoring benign wandb teardown error: %s", exc)
+    except RuntimeError as exc:
+        if "Event loop is closed" in str(exc):
+            logging.getLogger(__name__).debug("Ignoring benign wandb teardown runtime error: %s", exc)
+            return
+        logging.getLogger(__name__).exception("Failed to finish wandb run")
     except Exception:
         logging.getLogger(__name__).exception("Failed to finish wandb run")
 

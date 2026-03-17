@@ -1,10 +1,116 @@
 import logging
 import os
+import threading
 from copy import deepcopy
 
 import wandb
 
 logger = logging.getLogger(__name__)
+_FINISH_LOCK = threading.Lock()
+_FINISH_CALLED = False
+_SERVICE_PATCH_LOCK = threading.Lock()
+_SERVICE_PATCH_INSTALLED = False
+
+
+def _is_benign_wandb_teardown_error(exc: BaseException) -> bool:
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+        return True
+    return isinstance(exc, RuntimeError) and "Event loop is closed" in str(exc)
+
+
+def ensure_wandb_service_teardown_patch_installed() -> None:
+    """Patch wandb service atexit teardown to silence known benign shutdown noise."""
+    global _SERVICE_PATCH_INSTALLED
+    with _SERVICE_PATCH_LOCK:
+        if _SERVICE_PATCH_INSTALLED:
+            return
+
+        try:
+            from wandb.sdk.lib.service import service_connection
+        except Exception as exc:
+            logger.debug("Skipping wandb service teardown patch; import failed: %s", exc)
+            _SERVICE_PATCH_INSTALLED = True
+            return
+
+        original = getattr(service_connection, "_start_and_connect_service", None)
+        original_teardown = getattr(service_connection.ServiceConnection, "teardown", None)
+        if original is None or getattr(original, "_slime_patched", False):
+            _SERVICE_PATCH_INSTALLED = True
+            return
+
+        if original_teardown is not None and not getattr(original_teardown, "_slime_patched", False):
+            def _patched_teardown(self, exit_code):
+                try:
+                    return original_teardown(self, exit_code)
+                except Exception as exc:
+                    if _is_benign_wandb_teardown_error(exc):
+                        logger.debug("Ignoring benign wandb service teardown error: %s", exc)
+                        return None
+                    raise
+
+            _patched_teardown._slime_patched = True  # type: ignore[attr-defined]
+            service_connection.ServiceConnection.teardown = _patched_teardown
+
+        def _patched_start_and_connect_service(asyncer, settings):
+            proc = service_connection.service_process.start(settings)
+            client = proc.token.connect(asyncer=asyncer)
+            proc.token.save_to_env()
+
+            hooks = service_connection.ExitHooks()
+            hooks.hook()
+
+            def teardown_atexit():
+                try:
+                    conn.teardown(hooks.exit_code)
+                except Exception as exc:
+                    if _is_benign_wandb_teardown_error(exc):
+                        logger.debug("Ignoring benign wandb atexit teardown error: %s", exc)
+                        return
+                    raise
+
+            conn = service_connection.ServiceConnection(
+                asyncer=asyncer,
+                client=client,
+                proc=proc,
+                cleanup=lambda: service_connection.atexit.unregister(teardown_atexit),
+            )
+
+            service_connection.atexit.register(teardown_atexit)
+            return conn
+
+        _patched_start_and_connect_service._slime_patched = True  # type: ignore[attr-defined]
+        _patched_start_and_connect_service._slime_original = original  # type: ignore[attr-defined]
+        service_connection._start_and_connect_service = _patched_start_and_connect_service
+        _SERVICE_PATCH_INSTALLED = True
+
+
+def reset_wandb_finish_guard_for_tests() -> None:
+    global _FINISH_CALLED
+    with _FINISH_LOCK:
+        _FINISH_CALLED = False
+
+
+def reset_wandb_service_patch_for_tests() -> None:
+    global _SERVICE_PATCH_INSTALLED
+    with _SERVICE_PATCH_LOCK:
+        _SERVICE_PATCH_INSTALLED = False
+
+
+def finish_wandb_once() -> bool:
+    """Finish the current W&B run at most once per process.
+
+    Returns True only when this call performed the actual finish attempt.
+    """
+    global _FINISH_CALLED
+    with _FINISH_LOCK:
+        if _FINISH_CALLED:
+            return False
+        if getattr(wandb, "run", None) is None:
+            _FINISH_CALLED = True
+            return False
+        _FINISH_CALLED = True
+    wandb.finish()
+    return True
 
 
 def _is_offline_mode(args) -> bool:
