@@ -310,6 +310,48 @@ class LiveWebEnvironmentAdapter(EnvironmentAdapter):
         metrics["env/format_failure_terminal_rate"] = (
             sum(terminal_rates) / len(terminal_rates) if terminal_rates else 0.0
         )
+        progress_scores = [
+            float(((item.raw_result.get("extra") or {}).get("progress_summary") or {}).get("progress_score", 0.0))
+            for item in results
+        ]
+        metrics["env/mean_progress_score"] = (
+            sum(progress_scores) / len(progress_scores) if progress_scores else 0.0
+        )
+        metrics["env/near_miss_rate"] = _rate(
+            lambda item: ((item.raw_result.get("extra") or {}).get("learning_bucket") == "near_miss")
+        )
+        metrics["env/wrong_path_rate"] = _rate(
+            lambda item: ((item.raw_result.get("extra") or {}).get("learning_bucket") == "wrong_path")
+        )
+        metrics["env/learning_bucket/environment_failure_rate"] = _rate(
+            lambda item: ((item.raw_result.get("extra") or {}).get("learning_bucket") == "environment_failure")
+        )
+        metrics["env/learning_bucket/format_failure_rate"] = _rate(
+            lambda item: ((item.raw_result.get("extra") or {}).get("learning_bucket") == "format_failure")
+        )
+        audits = [(item.raw_result.get("extra") or {}).get("reachability_audit") or {} for item in results]
+        nonempty_audits = [audit for audit in audits if audit]
+        metrics["env/reachability_audit_count"] = float(len(nonempty_audits))
+        if nonempty_audits:
+            metrics["env/reachability_env_failure_rate"] = sum(
+                1.0 if audit.get("is_environment_failure") else 0.0 for audit in nonempty_audits
+            ) / len(nonempty_audits)
+            metrics["env/reachability_model_hallucination_rate"] = sum(
+                1.0 if audit.get("is_model_hallucination") else 0.0 for audit in nonempty_audits
+            ) / len(nonempty_audits)
+            for classification in (
+                "env_nav_aborted",
+                "env_target_closed",
+                "env_nav_timeout",
+                "env_tls_error",
+                "env_cdn_blocked",
+                "env_api_rate_limited",
+                "env_api_empty",
+            ):
+                metric_name = classification.replace("env_", "env/reachability_") + "_rate"
+                metrics[metric_name] = sum(
+                    1.0 if audit.get("classification") == classification else 0.0 for audit in nonempty_audits
+                ) / len(nonempty_audits)
         return metrics
 
     @staticmethod
@@ -318,6 +360,11 @@ class LiveWebEnvironmentAdapter(EnvironmentAdapter):
         failure_reason = extra.get("failure_reason")
         error = result.get("error") or ""
         cache_stats = extra.get("cache_stats") or {}
+        reachability_audit = extra.get("reachability_audit") or {}
+        audit_classification = reachability_audit.get("classification")
+
+        if audit_classification:
+            return audit_classification
 
         if failure_reason == "site_unreachable":
             if "prefetch" in error.lower():

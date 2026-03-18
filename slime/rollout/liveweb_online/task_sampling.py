@@ -170,6 +170,9 @@ class LiveWebDynamicSampler:
                 "env_error_rate": 0.0,
                 "accepted_rate": 0.0,
                 "zero_std_rate": 0.0,
+                "mean_progress_score": 0.0,
+                "near_miss_rate": 0.0,
+                "format_failure_rate": 0.0,
                 "count": 0.0,
             }
 
@@ -187,6 +190,9 @@ class LiveWebDynamicSampler:
             "env_error_rate": sum(float(record["env_error_rate"]) for record in records) / len(records),
             "accepted_rate": sum(float(record["accepted"]) for record in records) / len(records),
             "zero_std_rate": sum(float(record["zero_std"]) for record in records) / len(records),
+            "mean_progress_score": sum(float(record["mean_progress_score"]) for record in records) / len(records),
+            "near_miss_rate": sum(float(record["near_miss_rate"]) for record in records) / len(records),
+            "format_failure_rate": sum(float(record["format_failure_rate"]) for record in records) / len(records),
             "count": float(len(records)),
         }
 
@@ -215,7 +221,31 @@ class LiveWebDynamicSampler:
             penalty_floor = 0.25
             noise_penalty = max(penalty_floor, 1.0 - summary["env_error_rate"])
             zero_std_penalty = max(penalty_floor, 1.0 - (summary["zero_std_rate"] * 0.75))
-        return base * utility_weight * difficulty_weight * noise_penalty * zero_std_penalty
+
+        site_penalty = 1.0
+        plugin_set = set(candidate.plugin_names)
+        if phase == "main":
+            if "taostats" in plugin_set:
+                site_penalty *= max(0.20, 1.0 - (summary["env_error_rate"] * 1.6))
+            if "stooq" in plugin_set:
+                site_penalty *= max(0.30, 1.0 - (summary["env_error_rate"] * 1.25))
+            if "coingecko" in plugin_set:
+                site_penalty *= max(0.40, 1.0 - (summary["env_error_rate"] * 1.0))
+        progress_bonus = 1.0
+        format_penalty = 1.0
+        if os.getenv("LIVEWEB_ENABLE_PROGRESS_AWARE_SAMPLER", "0") == "1":
+            progress_bonus = min(1.5, max(0.85, 0.85 + summary["mean_progress_score"]))
+            format_penalty = min(1.0, max(0.75, 1.0 - (0.5 * summary["format_failure_rate"])))
+        return (
+            base
+            * utility_weight
+            * difficulty_weight
+            * noise_penalty
+            * zero_std_penalty
+            * site_penalty
+            * progress_bonus
+            * format_penalty
+        )
 
     def sample(self, *, seed: int, phase: str, evaluation: bool = False) -> dict[str, Any]:
         TaskRegistry, parse_task_id = registry_symbols()
@@ -274,5 +304,8 @@ class LiveWebDynamicSampler:
                     "env_error_rate": float(item.get("env_error_rate", 0.0)),
                     "accepted": 1.0 if item.get("accepted") else 0.0,
                     "zero_std": 1.0 if item.get("zero_std") else 0.0,
+                    "mean_progress_score": float(item.get("mean_progress_score", 0.0)),
+                    "near_miss_rate": float(item.get("near_miss_rate", 0.0)),
+                    "format_failure_rate": float(item.get("format_failure_rate", 0.0)),
                 }
             )

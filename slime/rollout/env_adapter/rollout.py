@@ -152,6 +152,8 @@ def _materialize_sample(
                     "time_taken": result.time_taken,
                     "failure_kind": result.failure_kind.value if result.failure_kind else None,
                     "raw_reward": result.reward,
+                    "learning_bucket": ((result.raw_result.get("extra") or {}).get("learning_bucket")),
+                    "progress_summary": ((result.raw_result.get("extra") or {}).get("progress_summary") or {}),
                 }
             )
             return sample, result
@@ -367,6 +369,27 @@ def _run_groups(args, groups: list[list[Sample]], evaluation: bool, rollout_id: 
                 "env_error_rate": (
                     sum(1.0 if item.environment_pollution else 0.0 for item in group_results) / len(group_results)
                 ) if group_results else 0.0,
+                "mean_progress_score": (
+                    sum(
+                        float(((item.raw_result.get("extra") or {}).get("progress_summary") or {}).get("progress_score", 0.0))
+                        for item in group_results
+                    )
+                    / len(group_results)
+                ) if group_results else 0.0,
+                "near_miss_rate": (
+                    sum(
+                        1.0 if ((item.raw_result.get("extra") or {}).get("learning_bucket") == "near_miss") else 0.0
+                        for item in group_results
+                    )
+                    / len(group_results)
+                ) if group_results else 0.0,
+                "format_failure_rate": (
+                    sum(
+                        1.0 if ((item.raw_result.get("extra") or {}).get("learning_bucket") == "format_failure") else 0.0
+                        for item in group_results
+                    )
+                    / len(group_results)
+                ) if group_results else 0.0,
                 "accepted": False,
                 "zero_std": zero_std,
             }
@@ -525,6 +548,20 @@ def generate_rollout(args, rollout_id, data_source, evaluation=False):
         total_requested_groups += len(extra_groups)
         total_requested_jobs += sum(len(group) for group in extra_groups)
         _merge_rollout_metrics(aggregate_metrics, extra_metrics)
+
+    if not accepted_groups:
+        error_examples = [
+            result.get("error")
+            for result in all_raw_results
+            if (result.get("extra") or {}).get("failure_reason") in {"rollout_exception", "site_unreachable", "cache_error"}
+            and result.get("error")
+        ][:3]
+        raise RuntimeError(
+            "Environment-adapter rollout produced no trainable groups; "
+            f"metrics={aggregate_metrics}; "
+            f"error_examples={error_examples}"
+        )
+
     metrics = _finalize_rollout_metrics(
         args=args,
         adapter=adapter,

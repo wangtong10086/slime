@@ -1,10 +1,13 @@
 from slime.env_adapters.base import FailureKind, RolloutResult
-from slime.rollout.env_adapter.rollout import _finalize_rollout_metrics, _merge_rollout_metrics
+from slime.rollout.env_adapter.rollout import _finalize_rollout_metrics, _merge_rollout_metrics, generate_rollout
+from slime.rollout.base_types import RolloutFnTrainOutput
 from slime.ray.rollout_batching import (
     choose_dynamic_global_batch_size,
     compute_train_trim_length,
     resolve_max_samples_per_rollout,
 )
+from types import SimpleNamespace
+import pytest
 
 
 class _DummyAdapter:
@@ -117,3 +120,47 @@ def test_dynamic_global_batch_size_prefers_remainder_free_steps():
         configured_cap=32,
         configured_min=16,
     ) == 28
+
+
+def test_env_adapter_generate_rollout_raises_on_empty_accepted_groups(monkeypatch):
+    class _DummyAdapterImpl:
+        name = "dummy"
+
+        def sample_tasks(self, split, count, phase):
+            return [{"task_id": i} for i in range(count)]
+
+        def expand_jobs(self, tasks, n_samples_per_task, mode):
+            jobs = []
+            for idx, _task in enumerate(tasks):
+                jobs.append(
+                    SimpleNamespace(
+                        group_id=f"group-{idx}",
+                        prompt_hint=f"prompt-{idx}",
+                        job_id=f"job-{idx}",
+                        affinity_key=f"aff-{idx}",
+                        to_dict=lambda idx=idx: {"metadata": {"combo_key": f"combo-{idx}"}, "task": {"metadata": {}}},
+                    )
+                )
+            return jobs
+
+    class _DummyState:
+        def __init__(self, args):
+            self.adapter = _DummyAdapterImpl()
+
+    def _fake_run_groups(args, groups, evaluation, rollout_id=None):
+        assert evaluation is False
+        return [], [], {"env/accepted_groups": 0.0}
+
+    monkeypatch.setattr("slime.rollout.env_adapter.rollout.AdapterRolloutState", _DummyState)
+    monkeypatch.setattr("slime.rollout.env_adapter.rollout._run_groups", _fake_run_groups)
+
+    args = SimpleNamespace(
+        rollout_batch_size=2,
+        n_samples_per_prompt=2,
+        global_batch_size=4,
+        over_sampling_batch_size=2,
+    )
+    data_source = SimpleNamespace(get_samples=lambda n: [[object()] for _ in range(n)])
+
+    with pytest.raises(RuntimeError, match="produced no trainable groups"):
+        generate_rollout(args, rollout_id=0, data_source=data_source, evaluation=False)

@@ -28,6 +28,8 @@ from .task_sampling import (
 )
 
 ENV_POLLUTION_FAILURES = {"site_unreachable", "cache_error", "llm_error", "rollout_exception"}
+FORMAT_FAILURE_REASONS = {"parse_failed", "invalid_tool_format"}
+PROGRESS_SHAPING_SIGNALS = {"target_asset", "detail_page_visit", "all_targets"}
 DEFAULT_PREWARM_URLS = {
     "hackernews": [
         "https://news.ycombinator.com/",
@@ -242,15 +244,167 @@ def classify_environment_failure(result: dict[str, Any]) -> str | None:
     return failure_reason if failure_reason in ENV_POLLUTION_FAILURES else None
 
 
+def _answer_is_present(value: Any) -> bool:
+    return value not in (None, "", [], {})
+
+
+def _coverage(numerator: int, denominator: int) -> float:
+    if denominator <= 0:
+        return 0.0
+    return numerator / denominator
+
+
+def build_progress_summary(
+    *,
+    required_domains: list[str] | set[str] | None = None,
+    visited_domains: list[str] | set[str] | None = None,
+    target_assets: list[str] | set[str] | None = None,
+    collected_target_assets: list[str] | set[str] | None = None,
+    confirmed_targets: list[str] | set[str] | None = None,
+    answer_details: list[dict[str, Any]] | None = None,
+    answer_slots_total: int | None = None,
+    num_subtasks: int | None = None,
+) -> dict[str, Any]:
+    required_domain_set = set(required_domains or [])
+    visited_domain_set = set(visited_domains or [])
+    target_asset_set = set(target_assets or [])
+    collected_target_set = set(collected_target_assets or [])
+    confirmed_target_set = set(confirmed_targets or [])
+    answer_details = answer_details or []
+
+    if answer_slots_total is None:
+        answer_slots_total = max(len(answer_details), int(num_subtasks or 0))
+
+    required_domains_total = len(required_domain_set)
+    required_domains_visited = len(required_domain_set & visited_domain_set)
+    target_assets_total = len(target_asset_set)
+    target_assets_collected = len(target_asset_set & collected_target_set)
+    confirmed_targets_collected = len(target_asset_set & confirmed_target_set)
+    valid_answers = sum(1 for item in answer_details if _answer_is_present(item.get("actual")))
+
+    required_domain_coverage = _coverage(required_domains_visited, required_domains_total)
+    target_asset_coverage = _coverage(target_assets_collected, target_assets_total)
+    confirmed_target_coverage = _coverage(confirmed_targets_collected, target_assets_total)
+    valid_answer_coverage = _coverage(valid_answers, answer_slots_total)
+
+    coverage_terms: list[float] = []
+    if required_domains_total > 0:
+        coverage_terms.append(required_domain_coverage)
+    if target_assets_total > 0:
+        coverage_terms.append(target_asset_coverage)
+        coverage_terms.append(confirmed_target_coverage)
+    if answer_slots_total > 0:
+        coverage_terms.append(valid_answer_coverage)
+
+    progress_score = sum(coverage_terms) / len(coverage_terms) if coverage_terms else 0.0
+    return {
+        "required_domains_total": required_domains_total,
+        "required_domains_visited": required_domains_visited,
+        "required_domain_coverage": required_domain_coverage,
+        "target_assets_total": target_assets_total,
+        "target_assets_collected": target_assets_collected,
+        "target_asset_coverage": target_asset_coverage,
+        "confirmed_targets_collected": confirmed_targets_collected,
+        "confirmed_target_coverage": confirmed_target_coverage,
+        "answer_slots_total": answer_slots_total,
+        "valid_answers": valid_answers,
+        "valid_answer_coverage": valid_answer_coverage,
+        "progress_score": progress_score,
+    }
+
+
+def classify_learning_bucket(
+    *,
+    failure_reason: str | None,
+    success: bool,
+    score: float,
+    progress_score: float,
+) -> str:
+    if failure_reason in ENV_POLLUTION_FAILURES:
+        return "environment_failure"
+    if failure_reason in FORMAT_FAILURE_REASONS:
+        return "format_failure"
+    if success:
+        return "success"
+    near_miss_progress_threshold = float(os.getenv("LIVEWEB_NEAR_MISS_PROGRESS_THRESHOLD", "0.35"))
+    if score >= 0.3 or progress_score >= near_miss_progress_threshold:
+        return "near_miss"
+    return "wrong_path"
+
+
+def _sum_positive_step_signals(step_rewards: list[dict[str, Any]], signal_names: set[str]) -> float:
+    total = 0.0
+    for step_reward in step_rewards:
+        for signal in step_reward.get("signals") or []:
+            if signal.get("signal") in signal_names:
+                total += max(0.0, float(signal.get("value", 0.0)))
+    return total
+
+
+def _extract_confirmed_targets(step_rewards: list[dict[str, Any]]) -> set[str]:
+    confirmed_targets: set[str] = set()
+    for step_reward in step_rewards:
+        for signal in step_reward.get("signals") or []:
+            if signal.get("signal") != "detail_page_visit":
+                continue
+            reason = str(signal.get("reason") or "")
+            if reason.startswith("Detail: "):
+                confirmed_targets.add(reason.split(": ", 1)[1].strip())
+    return confirmed_targets
+
+
+def _aligned_collected_asset_snapshots(
+    snapshots: list[set[str]],
+    *,
+    trajectory_len: int,
+) -> list[set[str]]:
+    if trajectory_len <= 0:
+        return []
+    if not snapshots:
+        return [set() for _ in range(trajectory_len)]
+    if len(snapshots) == trajectory_len + 1:
+        snapshots = snapshots[1:]
+    elif len(snapshots) > trajectory_len:
+        snapshots = snapshots[-trajectory_len:]
+    elif len(snapshots) < trajectory_len:
+        snapshots = [*snapshots, *([set(snapshots[-1])] * (trajectory_len - len(snapshots)))]
+    return [set(snapshot) for snapshot in snapshots]
+
+
 def compute_reward_from_result(result: dict[str, Any]) -> tuple[float | None, dict[str, Any]]:
     extra = result.get("extra") or {}
     failure_reason = extra.get("failure_reason")
     environment_failure_type = classify_environment_failure(result)
+    answer_details = extra.get("answer_details") or []
+    progress_summary = extra.get("progress_summary")
+    if not isinstance(progress_summary, dict) or "progress_score" not in progress_summary:
+        progress_summary = build_progress_summary(
+            required_domains=extra.get("required_domains") or [],
+            visited_domains=extra.get("visited_domains") or [],
+            target_assets=extra.get("target_assets") or [],
+            collected_target_assets=extra.get("collected_target_assets") or [],
+            confirmed_targets=extra.get("confirmed_targets") or [],
+            answer_details=answer_details,
+            answer_slots_total=extra.get("answer_slots_total"),
+            num_subtasks=extra.get("num_subtasks"),
+        )
+    learning_bucket = str(
+        extra.get("learning_bucket")
+        or classify_learning_bucket(
+            failure_reason=failure_reason,
+            success=bool(result.get("success", False)),
+            score=float(result.get("score", 0.0)),
+            progress_score=float(progress_summary.get("progress_score", 0.0)),
+        )
+    )
     if environment_failure_type is not None:
         return None, {
             "drop_reason": environment_failure_type,
             "environment_failure_type": environment_failure_type,
             "raw_reward": result.get("score", 0.0),
+            "learning_bucket": learning_bucket,
+            "progress_summary": progress_summary,
+            **progress_summary,
         }
 
     final_score = float(result.get("score", 0.0))
@@ -259,14 +413,20 @@ def compute_reward_from_result(result: dict[str, Any]) -> tuple[float | None, di
     required_domains = set(extra.get("required_domains") or [])
     visited_domains = set(extra.get("visited_domains") or [])
     if required_domains:
-        visited_required = len(required_domains & visited_domains)
+        visited_required = int(progress_summary.get("required_domains_visited", 0))
         shaping += min(0.06, 0.02 * visited_required)
         if visited_required >= 2 and final_score > 0.0:
             shaping += 0.03
 
-    answer_details = extra.get("answer_details") or []
-    valid_answers = sum(1 for item in answer_details if item.get("actual") not in (None, "", [], {}))
+    valid_answers = int(progress_summary.get("valid_answers", 0))
     shaping += min(0.05, 0.01 * valid_answers)
+
+    if os.getenv("LIVEWEB_ENABLE_PROGRESS_SHAPING", "1") == "1":
+        target_progress_signal_total = _sum_positive_step_signals(
+            (result.get("rewards") or {}).get("step_rewards") or [],
+            PROGRESS_SHAPING_SIGNALS,
+        )
+        shaping += min(0.05, 0.2 * target_progress_signal_total)
 
     if failure_reason == "parse_failed":
         shaping -= 0.10
@@ -290,6 +450,9 @@ def compute_reward_from_result(result: dict[str, Any]) -> tuple[float | None, di
         "raw_reward": final_score,
         "final_score": final_score,
         "shaping_reward": shaping,
+        "learning_bucket": learning_bucket,
+        "progress_summary": progress_summary,
+        **progress_summary,
     }
 
 
@@ -460,6 +623,11 @@ def make_sample_from_result(
         "plugin_names": (result.get("extra") or {}).get("plugin_names") or [],
         "required_domains": (result.get("extra") or {}).get("required_domains") or [],
         "visited_domains": (result.get("extra") or {}).get("visited_domains") or [],
+        "target_assets": (result.get("extra") or {}).get("target_assets") or [],
+        "collected_target_assets": (result.get("extra") or {}).get("collected_target_assets") or [],
+        "confirmed_targets": (result.get("extra") or {}).get("confirmed_targets") or [],
+        "progress_summary": (result.get("extra") or {}).get("progress_summary") or reward_meta.get("progress_summary") or {},
+        "learning_bucket": (result.get("extra") or {}).get("learning_bucket") or reward_meta.get("learning_bucket"),
     }
     usage = sample.metadata["usage"]
     sample.metadata["prompt_tokens"] = usage.get("prompt_tokens", 0)
@@ -665,7 +833,7 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
     from liveweb_arena.core.agent_protocol import FunctionCallingProtocol
     from liveweb_arena.core.gt_collector import GTCollector, set_current_gt_collector
     from liveweb_arena.core.parser import AnswerParser
-    from liveweb_arena.core.reward import StepwiseRewardCalculator
+    from liveweb_arena.core.reward import RewardConfig, StepwiseRewardCalculator
     from liveweb_arena.core.validators.llm_validator import validate_answers_with_llm
     _, _handle_navigation_event, _handle_observation_event = import_liveweb_env_symbols()
 
@@ -681,6 +849,7 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
         interceptor = None
         gt_collector = None
         cached_pages: dict[str, Any] = {}
+        collected_asset_snapshots: list[set[str]] = []
         exception_stage = "init"
         try:
             exception_stage = "ensure_browser"
@@ -694,6 +863,19 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
             )
             total_expected_steps = sum(subtask.expected_steps for subtask in task.subtasks)
             effective_max_steps = max(read_int_env("LIVEWEB_MAX_STEPS", 30), total_expected_steps)
+            target_assets: set[str] = set()
+            required_domains: set[str] = set()
+            reward_overrides: dict[str, float] = {}
+            for subtask in task.subtasks:
+                template = getattr(subtask, "template", None)
+                if template is None:
+                    continue
+                target_assets.update(template.get_target_assets(subtask.validation_info))
+                required_domains.update(template.get_required_domains(subtask.validation_info))
+                overrides = template.get_reward_overrides()
+                if overrides:
+                    reward_overrides.update(overrides)
+            reward_config = RewardConfig(**reward_overrides) if reward_overrides else RewardConfig()
 
             plugins_used, allowed_domains, blocked_patterns = actor._collect_plugin_info(task)
 
@@ -734,6 +916,7 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
                     obs=obs,
                     use_cache=actor.use_cache,
                 )
+                collected_asset_snapshots.append(set(gt_collector.get_collected_api_data().keys()))
 
             protocol = FunctionCallingProtocol()
             agent_llm_client = actor._build_llm_client(
@@ -839,16 +1022,21 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
                 success = False
 
             reward_calc = StepwiseRewardCalculator(
-                target_assets=set(),
-                required_domains=allowed_domains,
+                config=reward_config,
+                target_assets=target_assets,
+                required_domains=required_domains,
             )
             step_rewards = []
-            for step in trajectory:
+            aligned_snapshots = _aligned_collected_asset_snapshots(
+                collected_asset_snapshots,
+                trajectory_len=len(trajectory),
+            )
+            for step, collected_asset_ids in zip(trajectory, aligned_snapshots, strict=False):
                 url = step.observation.url
                 reward = reward_calc.calculate_step_reward(
                     url=url,
                     action_result=step.action_result,
-                    collected_asset_ids=set(),
+                    collected_asset_ids=collected_asset_ids,
                     is_blocked=interceptor._should_block(url) if url != "about:blank" else False,
                     parse_failed=(step.action is None),
                 )
@@ -863,6 +1051,25 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
             interceptor_stats = interceptor.get_stats()
             final_url = trajectory[-1].observation.url if trajectory else None
             conversation = actor._build_conversation(task, trajectory, protocol)
+            collected_assets = set(gt_collector.get_collected_api_data().keys())
+            collected_target_assets = target_assets & collected_assets
+            confirmed_targets = target_assets & _extract_confirmed_targets(step_rewards)
+            progress_summary = build_progress_summary(
+                required_domains=required_domains,
+                visited_domains=reward_calc.get_state().get("visited_domains", []),
+                target_assets=target_assets,
+                collected_target_assets=collected_target_assets,
+                confirmed_targets=confirmed_targets,
+                answer_details=answer_validations,
+                answer_slots_total=len(task.subtasks),
+                num_subtasks=job.num_subtasks,
+            )
+            learning_bucket = classify_learning_bucket(
+                failure_reason=failure_reason,
+                success=success,
+                score=total_score,
+                progress_score=float(progress_summary["progress_score"]),
+            )
 
             result = {
                 "task_name": job.task_name,
@@ -889,8 +1096,13 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
                     "steps_used": len(trajectory),
                     "plugin_name": job.plugin_name,
                     "plugin_names": list(job.plugin_names),
-                    "required_domains": sorted(allowed_domains),
+                    "required_domains": sorted(required_domains),
                     "visited_domains": sorted(reward_calc.get_state().get("visited_domains", [])),
+                    "target_assets": sorted(target_assets),
+                    "collected_target_assets": sorted(collected_target_assets),
+                    "confirmed_targets": sorted(confirmed_targets),
+                    "progress_summary": progress_summary,
+                    "learning_bucket": learning_bucket,
                     "browser_rebuild_count": state.browser_rebuild_count,
                     "browser_reuse_failures": state.browser_reuse_failures,
                     "browser_recovery_success_count": state.browser_recovery_success_count,
@@ -967,6 +1179,11 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
             "plugin_names": list(job.plugin_names),
             "required_domains": [],
             "visited_domains": [],
+            "target_assets": [],
+            "collected_target_assets": [],
+            "confirmed_targets": [],
+            "progress_summary": build_progress_summary(),
+            "learning_bucket": "environment_failure",
             "exception_type": type(exc).__name__,
             "exception_stage": last_stage,
             "browser_transport_closed": browser_transport_closed,
