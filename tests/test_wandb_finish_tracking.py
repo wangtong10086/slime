@@ -18,7 +18,92 @@ from slime.utils import logging_utils, wandb_utils
 
 
 def _args(use_wandb: bool = True):
-    return SimpleNamespace(use_wandb=use_wandb)
+    return SimpleNamespace(use_wandb=use_wandb, use_tensorboard=False)
+
+
+def test_log_prunes_duplicate_liveweb_metrics_for_wandb(monkeypatch):
+    logged = {}
+
+    def _log(metrics):
+        logged.update(metrics)
+
+    monkeypatch.setattr(logging_utils.wandb, "log", _log, raising=False)
+    monkeypatch.setenv("SLIME_WANDB_PRUNE_METRICS", "1")
+    monkeypatch.setenv("SLIME_ENVIRONMENT_NAME", "liveweb")
+
+    metrics = {
+        "rollout/step": 7,
+        "scheduler/runtime_completed_jobs": 128.0,
+        "scheduler/completed_jobs": 128.0,
+        "scheduler/config_max_parallel_env_jobs": 32.0,
+        "env/jit_kernel_enabled": 0.0,
+        "env/format_recovery_attempts": 5.0,
+        "env/format_recovery_success_rate": 0.2,
+        "env/parse_failed_rate": 0.0,
+        "cache/hit_rate": 0.93,
+        "rollout/response_len/mean": 640.0,
+    }
+
+    logging_utils.log(_args(), metrics, step_key="rollout/step")
+
+    assert logged["rollout/step"] == 7
+    assert logged["scheduler/runtime_completed_jobs"] == 128.0
+    assert logged["env/format_recovery_success_rate"] == 0.2
+    assert logged["env/parse_failed_rate"] == 0.0
+    assert logged["cache/hit_rate"] == 0.93
+    assert logged["rollout/response_len/mean"] == 640.0
+    assert "scheduler/completed_jobs" not in logged
+    assert "scheduler/config_max_parallel_env_jobs" not in logged
+    assert "env/jit_kernel_enabled" not in logged
+    assert "env/format_recovery_attempts" not in logged
+
+
+def test_log_can_disable_metric_pruning(monkeypatch):
+    logged = {}
+
+    def _log(metrics):
+        logged.update(metrics)
+
+    monkeypatch.setattr(logging_utils.wandb, "log", _log, raising=False)
+    monkeypatch.setenv("SLIME_WANDB_PRUNE_METRICS", "0")
+    monkeypatch.setenv("SLIME_ENVIRONMENT_NAME", "liveweb")
+
+    metrics = {
+        "rollout/step": 3,
+        "scheduler/completed_jobs": 64.0,
+        "env/format_recovery_attempts": 2.0,
+    }
+
+    logging_utils.log(_args(), metrics, step_key="rollout/step")
+
+    assert logged == metrics
+
+
+def test_log_keeps_only_top_level_eval_metrics_for_liveweb(monkeypatch):
+    logged = {}
+
+    def _log(metrics):
+        logged.update(metrics)
+
+    monkeypatch.setattr(logging_utils.wandb, "log", _log, raising=False)
+    monkeypatch.setenv("SLIME_WANDB_PRUNE_METRICS", "1")
+    monkeypatch.setenv("SLIME_ENVIRONMENT_NAME", "liveweb")
+
+    metrics = {
+        "eval/step": 11,
+        "eval/liveweb_dummy": 0.42,
+        "eval/liveweb_dummy/response_len/mean": 888.0,
+        "eval_env/parse_failed_rate": 0.1,
+        "eval_scheduler/runtime_completed_jobs": 32.0,
+    }
+
+    logging_utils.log(_args(), metrics, step_key="eval/step")
+
+    assert logged["eval/step"] == 11
+    assert logged["eval/liveweb_dummy"] == 0.42
+    assert logged["eval_env/parse_failed_rate"] == 0.1
+    assert "eval/liveweb_dummy/response_len/mean" not in logged
+    assert "eval_scheduler/runtime_completed_jobs" not in logged
 
 
 def test_finish_tracking_is_idempotent(monkeypatch):
