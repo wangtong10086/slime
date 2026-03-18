@@ -212,6 +212,10 @@ export LIVEWEB_PREWARM_URLS="${LIVEWEB_PREWARM_URLS:-https://news.ycombinator.co
 export LIVEWEB_REQUIRED_SOFT_URL_REGEXES="${LIVEWEB_REQUIRED_SOFT_URL_REGEXES:-^news\\.ycombinator\\.com/?$,^news\\.ycombinator\\.com/(ask|show|jobs|newest)(?:[/?].*)?$,^openlibrary\\.org/(search|subjects)(?:[/?].*)?$,^(?:www\\.)?taostats\\.io(?:/(subnets(?:/.*)?)?)?$}"
 export LIVEWEB_PREFETCH_SOFT_URL_REGEXES="${LIVEWEB_PREFETCH_SOFT_URL_REGEXES:-^channelsurfer\\.tv(?:/.*)?$,^runcaptain\\.com(?:/.*)?$,^aether\\.saphal\\.me(?:/.*)?$,^openlibrary\\.org/(search|subjects)(?:[/?].*)?$,^(?:www\\.)?taostats\\.io(?:/(subnets(?:/.*)?)?)?$}"
 export LIVEWEB_RUNTIME_JIT_KERNEL_ENABLED="${LIVEWEB_RUNTIME_JIT_KERNEL_ENABLED:-1}"
+export LIVEWEB_SGLANG_STARTUP_JIT_ENABLED="${LIVEWEB_SGLANG_STARTUP_JIT_ENABLED:-0}"
+export LIVEWEB_ROLLOUT_BOOT_MODE="${LIVEWEB_ROLLOUT_BOOT_MODE:-lazy_weights}"
+export LIVEWEB_SKIP_INITIAL_WEIGHT_SYNC_IF_RESUME_EXPORT="${LIVEWEB_SKIP_INITIAL_WEIGHT_SYNC_IF_RESUME_EXPORT:-0}"
+export LIVEWEB_PARALLEL_ROUTER_PREPARE="${LIVEWEB_PARALLEL_ROUTER_PREPARE:-1}"
 export LIVEWEB_RUNTIME_KERNEL_FALLBACK="${LIVEWEB_RUNTIME_KERNEL_FALLBACK:-0}"
 export LIVEWEB_RUNTIME_KERNEL_FALLBACK_REASON="${LIVEWEB_RUNTIME_KERNEL_FALLBACK_REASON:-unknown}"
 export LIVEWEB_TASK_MIX_CONFIG="${LIVEWEB_TASK_MIX_CONFIG:-${SLIME_DIR}/scripts/configs/liveweb_online_task_mix.json}"
@@ -619,6 +623,10 @@ cat > "${RUN_ROOT}/run_config.json" <<JSON
   "max_parallel_env_jobs": ${SLIME_ENV_MAX_PARALLEL_ENV_JOBS},
   "max_parallel_llm_jobs": ${SLIME_ENV_MAX_PARALLEL_LLM_JOBS},
   "runtime_jit_kernel_enabled": ${LIVEWEB_RUNTIME_JIT_KERNEL_ENABLED},
+  "liveweb_sglang_startup_jit_enabled": ${LIVEWEB_SGLANG_STARTUP_JIT_ENABLED},
+  "liveweb_rollout_boot_mode": "${LIVEWEB_ROLLOUT_BOOT_MODE}",
+  "liveweb_skip_initial_weight_sync_if_resume_export": ${LIVEWEB_SKIP_INITIAL_WEIGHT_SYNC_IF_RESUME_EXPORT},
+  "liveweb_parallel_router_prepare": ${LIVEWEB_PARALLEL_ROUTER_PREPARE},
   "runtime_kernel_fallback": ${LIVEWEB_RUNTIME_KERNEL_FALLBACK},
   "runtime_kernel_fallback_reason": "${LIVEWEB_RUNTIME_KERNEL_FALLBACK_REASON}",
   "oversample_factor": ${SLIME_ENV_OVERSAMPLE_FACTOR},
@@ -738,6 +746,10 @@ env_vars = {
     "LIVEWEB_FORMAL_EVAL_PROMPTS": os.environ["LIVEWEB_FORMAL_EVAL_PROMPTS"],
     "LIVEWEB_FORMAL_EVAL_EVERY": os.environ["LIVEWEB_FORMAL_EVAL_EVERY"],
     "LIVEWEB_SKIP_SAVE": os.environ["LIVEWEB_SKIP_SAVE"],
+    "LIVEWEB_SGLANG_STARTUP_JIT_ENABLED": os.environ["LIVEWEB_SGLANG_STARTUP_JIT_ENABLED"],
+    "LIVEWEB_ROLLOUT_BOOT_MODE": os.environ["LIVEWEB_ROLLOUT_BOOT_MODE"],
+    "LIVEWEB_SKIP_INITIAL_WEIGHT_SYNC_IF_RESUME_EXPORT": os.environ["LIVEWEB_SKIP_INITIAL_WEIGHT_SYNC_IF_RESUME_EXPORT"],
+    "LIVEWEB_PARALLEL_ROUTER_PREPARE": os.environ["LIVEWEB_PARALLEL_ROUTER_PREPARE"],
     "LIVEWEB_ENABLE_PERIODIC_HF_EXPORT": os.environ["LIVEWEB_ENABLE_PERIODIC_HF_EXPORT"],
     "LIVEWEB_HF_EXPORT_INTERVAL": os.environ["LIVEWEB_HF_EXPORT_INTERVAL"],
     "RUN_ARCHIVE_CHECKPOINT_DIR": os.environ["RUN_ARCHIVE_CHECKPOINT_DIR"],

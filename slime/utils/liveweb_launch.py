@@ -65,3 +65,23 @@ def resolve_liveweb_run_config(
         "hf_only_load_dir": str(hf_dir.resolve()),
         "resume_checkpoint_dir": str(resume_checkpoint_path),
     }
+
+
+def validate_resume_rollout_range(
+    *,
+    start_rollout_id: int | None,
+    num_rollout: int | None,
+    resume_checkpoint_dir: str = "",
+) -> None:
+    if (
+        start_rollout_id is not None
+        and num_rollout is not None
+        and num_rollout > 0
+        and start_rollout_id >= num_rollout
+    ):
+        raise ValueError(
+            "Resume rollout range is empty: "
+            f"start_rollout_id={start_rollout_id}, "
+            f"num_rollout={num_rollout}, "
+            f"resume_checkpoint_dir={resume_checkpoint_dir or '<unset>'}"
+        )

@@ -4,6 +4,7 @@ import logging
 import multiprocessing
 import os
 import time
+from pathlib import Path
 from urllib.parse import quote
 from urllib.parse import urlparse
 
@@ -19,6 +20,40 @@ from slime.backends.sglang_utils.memory_budget import resolve_engine_mem_fractio
 from slime.utils.http_utils import get_host_info
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_sglang_startup_jit_config() -> tuple[bool, str]:
+    enabled = os.environ.get("LIVEWEB_SGLANG_STARTUP_JIT_ENABLED", "0") == "1"
+    if enabled:
+        return True, "enabled_by_env"
+    return False, "disabled_by_default_for_liveweb_resume"
+
+
+def _patch_sglang_startup_for_liveweb() -> None:
+    enabled, reason = resolve_sglang_startup_jit_config()
+    logging.getLogger(__name__).info(
+        "sglang/startup_jit_enabled=%s reason=%s",
+        str(enabled).lower(),
+        reason,
+    )
+    if enabled:
+        return
+
+    from sglang.jit_kernel import norm as norm_module
+    from sglang.srt.models import utils as model_utils
+
+    def _disable_qknorm_jit(_head_dim: int) -> bool:
+        return False
+
+    norm_module.can_use_fused_inplace_qknorm = _disable_qknorm_jit
+    model_utils.can_use_fused_inplace_qknorm = _disable_qknorm_jit
+
+
+def _launch_server_entry(server_args: ServerArgs) -> None:
+    _patch_sglang_startup_for_liveweb()
+    from sglang.srt.entrypoints.http_server import launch_server
+
+    launch_server(server_args)
 
 
 def _should_bypass_proxy(base_url: str) -> bool:
@@ -80,11 +115,9 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
 
 
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
-    from sglang.srt.entrypoints.http_server import launch_server
-
     multiprocessing.set_start_method("spawn", force=True)
     server_args.host = server_args.host.strip("[]")
-    p = multiprocessing.Process(target=launch_server, args=(server_args,))
+    p = multiprocessing.Process(target=_launch_server_entry, args=(server_args,))
     p.start()
 
     if server_args.node_rank != 0:
@@ -126,6 +159,7 @@ class SGLangEngine(RayActor):
         base_gpu_id: int | None = None,
         sglang_overrides: dict | None = None,
         num_gpus_per_engine: int | None = None,
+        is_updatable_group: bool = True,
     ):
         self.args = args
         self.rank = rank
@@ -133,6 +167,7 @@ class SGLangEngine(RayActor):
         self.base_gpu_id = base_gpu_id
         self.sglang_overrides = sglang_overrides or {}
         self.num_gpus_per_engine = num_gpus_per_engine
+        self.is_updatable_group = is_updatable_group
 
     def init(
         self,
@@ -175,6 +210,7 @@ class SGLangEngine(RayActor):
             base_gpu_id=self.base_gpu_id,
             sglang_overrides=self.sglang_overrides,
             num_gpus_per_engine=self.num_gpus_per_engine,
+            is_updatable_group=self.is_updatable_group,
         )
 
         self.node_rank = server_args_dict["node_rank"]
@@ -551,6 +587,7 @@ def _compute_server_args(
     base_gpu_id: int | None = None,
     sglang_overrides: dict | None = None,
     num_gpus_per_engine: int | None = None,
+    is_updatable_group: bool = True,
 ):
     _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
     nnodes = max(1, _gpus_per_engine // args.num_gpus_per_node)
@@ -583,6 +620,11 @@ def _compute_server_args(
         "enable_draft_weights_cpu_backup": True,
     }
 
+    bootstrap_model_path = getattr(args, "liveweb_rollout_bootstrap_model_path", None)
+    rollout_boot_mode = getattr(args, "liveweb_rollout_boot_mode", os.environ.get("LIVEWEB_ROLLOUT_BOOT_MODE", "eager_weights"))
+    if bootstrap_model_path and rollout_boot_mode == "lazy_weights" and is_updatable_group:
+        kwargs["model_path"] = str(Path(bootstrap_model_path))
+
     if worker_type == "prefill":
         kwargs["disaggregation_mode"] = "prefill"
         kwargs["load_balance_method"] = "round_robin"
@@ -612,6 +654,8 @@ def _compute_server_args(
     # Applied after base args so they take highest priority.
     if sglang_overrides:
         for key, value in sglang_overrides.items():
+            if key == "update_weights":
+                continue
             if key in kwargs:
                 logger.info(f"sglang_overrides: overriding {key}={kwargs[key]} -> {value} (rank={rank})")
             kwargs[key] = value

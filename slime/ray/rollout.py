@@ -41,6 +41,60 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+def resolve_rollout_bootstrap_metadata(args) -> dict[str, Any]:
+    boot_mode = os.environ.get("LIVEWEB_ROLLOUT_BOOT_MODE", "lazy_weights").strip().lower()
+    metadata = {
+        "boot_mode": boot_mode,
+        "bootstrap_model_path": None,
+        "bootstrap_model_source": "hf_checkpoint",
+        "skip_initial_weight_sync": False,
+    }
+
+    if boot_mode != "lazy_weights":
+        return metadata
+    if os.environ.get("LIVEWEB_RUN_MODE", "fresh") != "resume":
+        return metadata
+
+    load_dir = getattr(args, "load", None)
+    if not load_dir:
+        return metadata
+    checkpoint_root = Path(load_dir)
+    latest_file = checkpoint_root / "latest_checkpointed_iteration.txt"
+    if not latest_file.is_file():
+        return metadata
+
+    raw = latest_file.read_text().strip()
+    if not raw.isdigit():
+        return metadata
+
+    iteration = int(raw)
+    hf_export_dir = checkpoint_root.parent / "hf_exports" / f"iter_{iteration:07d}"
+    if not hf_export_dir.is_dir():
+        return metadata
+
+    metadata["bootstrap_model_path"] = str(hf_export_dir)
+    metadata["bootstrap_model_source"] = "resume_hf_export"
+    metadata["skip_initial_weight_sync"] = (
+        os.environ.get("LIVEWEB_SKIP_INITIAL_WEIGHT_SYNC_IF_RESUME_EXPORT", "0") == "1"
+    )
+    return metadata
+
+
+def prepare_rollout_startup(args) -> dict[str, dict[str, Any]]:
+    config = _resolve_sglang_config(args)
+    prepared: dict[str, dict[str, Any]] = {}
+    for model_idx, model_cfg in enumerate(config.models):
+        model_cfg.resolve(args)
+        has_pd = model_cfg.has_pd_disaggregation
+        router_ip, router_port = _start_router(args, has_pd_disaggregation=has_pd, force_new=(model_idx > 0))
+        prepared[model_cfg.name] = {
+            "router_ip": router_ip,
+            "router_port": router_port,
+            "has_pd_disaggregation": has_pd,
+        }
+    return prepared
+
+
 def _rewrite_eval_aux_metrics(metrics: dict[str, Any] | None) -> dict[str, Any]:
     """Route eval-only auxiliary metrics onto eval-specific namespaces."""
     if not metrics:
@@ -86,6 +140,7 @@ class ServerGroup:
     model_path: str | None = None  # checkpoint path for update_weights_from_disk
     router_ip: str | None = None
     router_port: int | None = None
+    is_updatable_group: bool = True
 
     @property
     def nodes_per_engine(self):
@@ -165,6 +220,7 @@ class ServerGroup:
                 base_gpu_id=base_gpu_id,
                 sglang_overrides=self.sglang_overrides,
                 num_gpus_per_engine=self.num_gpus_per_engine,
+                is_updatable_group=self.is_updatable_group,
             )
 
             rollout_engines.append((global_rank, rollout_engine))
@@ -1384,6 +1440,7 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
     as the HTTP client is shared across all servers.
     """
     config = _resolve_sglang_config(args)
+    prepared_routers = getattr(args, "liveweb_prepared_routers", None) or {}
 
     servers: dict[str, RolloutServer] = {}
     gpu_offset = 0
@@ -1397,7 +1454,18 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
         model_cfg.resolve(args)
 
         has_pd = model_cfg.has_pd_disaggregation
-        router_ip, router_port = _start_router(args, has_pd_disaggregation=has_pd, force_new=(model_idx > 0))
+        prepared_router = prepared_routers.get(model_cfg.name)
+        if prepared_router is not None:
+            router_ip = prepared_router["router_ip"]
+            router_port = prepared_router["router_port"]
+            logger.info(
+                "Using prepared router for model '%s' at %s:%s",
+                model_cfg.name,
+                router_ip,
+                router_port,
+            )
+        else:
+            router_ip, router_port = _start_router(args, has_pd_disaggregation=has_pd, force_new=(model_idx > 0))
 
         # Write back for backward compat (first model only).
         if model_idx == 0:
@@ -1417,6 +1485,16 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
             group_abs_start = rollout_pg_offset + gpu_offset
             needs_offload = args.offload_rollout and group_abs_start < megatron_num_gpus
             overrides = dict(group_cfg.overrides)
+            bootstrap_model_path = getattr(args, "liveweb_rollout_bootstrap_model_path", None)
+            bootstrap_model_source = getattr(args, "liveweb_rollout_bootstrap_model_source", "hf_checkpoint")
+            if model_cfg.update_weights and bootstrap_model_path:
+                overrides["model_path"] = bootstrap_model_path
+                logger.info(
+                    "Rollout boot mode for model '%s': using %s (%s)",
+                    model_cfg.name,
+                    bootstrap_model_path,
+                    bootstrap_model_source,
+                )
             if args.offload_rollout and not needs_offload:
                 overrides.setdefault("enable_memory_saver", False)
             logger.info(
@@ -1438,6 +1516,7 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
                 model_path=overrides.get("model_path", args.hf_checkpoint),
                 router_ip=router_ip,
                 router_port=router_port,
+                is_updatable_group=model_cfg.update_weights,
             )
             handles, port_cursors = group.start_engines(port_cursors)
             all_init_handles.extend(handles)

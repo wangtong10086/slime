@@ -1,5 +1,6 @@
 import os
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 import ray
 
@@ -10,6 +11,7 @@ from slime.ray.placement_group import (
     create_training_models,
     log_startup_memory_snapshot,
 )
+from slime.ray.rollout import prepare_rollout_startup, resolve_rollout_bootstrap_metadata
 from slime.utils.arguments import parse_args
 from slime.utils.checkpoint_retention import (
     build_staging_checkpoint_root,
@@ -19,6 +21,7 @@ from slime.utils.checkpoint_retention import (
     prune_training_checkpoints,
 )
 from slime.utils.logging_utils import configure_logger, init_tracking, finish_tracking
+from slime.utils.liveweb_launch import validate_resume_rollout_range
 from slime.utils.misc import should_run_periodic_action
 from slime.utils.save_guard import (
     SavePlan,
@@ -82,17 +85,46 @@ def train(args):
 
     num_rollout_per_epoch = None
     rollout_manager = None
+    rollout_startup_executor = None
+    rollout_prepare_future = None
+    rollout_bootstrap = resolve_rollout_bootstrap_metadata(args)
+    args.liveweb_rollout_boot_mode = rollout_bootstrap["boot_mode"]
+    args.liveweb_rollout_bootstrap_model_path = rollout_bootstrap["bootstrap_model_path"]
+    args.liveweb_rollout_bootstrap_model_source = rollout_bootstrap["bootstrap_model_source"]
+    args.liveweb_skip_initial_rollout_weight_sync = rollout_bootstrap["skip_initial_weight_sync"]
+    logger.info(
+        "startup/rollout_bootstrap boot_mode=%s source=%s model_path=%s skip_initial_weight_sync=%s",
+        args.liveweb_rollout_boot_mode,
+        args.liveweb_rollout_bootstrap_model_source,
+        args.liveweb_rollout_bootstrap_model_path,
+        args.liveweb_skip_initial_rollout_weight_sync,
+    )
     if staged_bringup:
+        if os.getenv("LIVEWEB_PARALLEL_ROUTER_PREPARE", "1") == "1":
+            logger.info("startup/router_prepare_begin")
+            log_startup_memory_snapshot("startup/router_prepare_begin")
+            rollout_startup_executor = ThreadPoolExecutor(max_workers=1)
+            rollout_prepare_future = rollout_startup_executor.submit(prepare_rollout_startup, args)
         logger.info("startup/restore_phase_begin")
         log_startup_memory_snapshot("startup/restore_phase_begin")
         actor_model, critic_model = create_training_models(args, pgs, rollout_manager=None)
         log_startup_memory_snapshot("startup/restore_phase_end", ready_count=args.actor_num_nodes * args.actor_num_gpus_per_node)
         logger.info("startup/restore_phase_end")
 
+        if rollout_prepare_future is not None:
+            args.liveweb_prepared_routers = rollout_prepare_future.result()
+            rollout_startup_executor.shutdown(wait=False)
+            log_startup_memory_snapshot("startup/router_prepare_end")
+            logger.info("startup/router_prepare_end")
+
         logger.info("startup/rollout_phase_begin")
         log_startup_memory_snapshot("startup/rollout_phase_begin")
+        logger.info("startup/rollout_heavy_bringup_begin")
+        log_startup_memory_snapshot("startup/rollout_heavy_bringup_begin")
         rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
         attach_rollout_manager_to_training_models(args, actor_model, critic_model, rollout_manager)
+        log_startup_memory_snapshot("startup/rollout_heavy_bringup_end")
+        logger.info("startup/rollout_heavy_bringup_end")
         log_startup_memory_snapshot("startup/rollout_phase_end")
         logger.info("startup/rollout_phase_end")
     else:
@@ -108,7 +140,15 @@ def train(args):
 
     # always update weight first so that sglang has the loaded weights from training.
     if not args.critic_train_only:
-        actor_model.update_weights()
+        if args.liveweb_skip_initial_rollout_weight_sync:
+            logger.info(
+                "startup/skip_initial_rollout_weight_sync boot_mode=%s source=%s model_path=%s",
+                args.liveweb_rollout_boot_mode,
+                args.liveweb_rollout_bootstrap_model_source,
+                args.liveweb_rollout_bootstrap_model_path,
+            )
+        else:
+            actor_model.update_weights()
 
         if args.check_weight_update_equal:
             ray.get(rollout_manager.check_weights.remote(action="compare"))
@@ -119,6 +159,12 @@ def train(args):
     # special case for eval-only
     if args.num_rollout == 0 and args.eval_interval is not None:
         ray.get(rollout_manager.eval.remote(rollout_id=0))
+
+    validate_resume_rollout_range(
+        start_rollout_id=args.start_rollout_id,
+        num_rollout=args.num_rollout,
+        resume_checkpoint_dir=os.getenv("RESUME_CHECKPOINT_DIR", ""),
+    )
 
     def offload_train(rollout_id):
         if args.offload_train:

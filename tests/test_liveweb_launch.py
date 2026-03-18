@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from slime.utils.liveweb_launch import resolve_liveweb_run_config
+from slime.utils.liveweb_launch import resolve_liveweb_run_config, validate_resume_rollout_range
 
 
 def test_resolve_liveweb_run_config_fresh_uses_run_checkpoint_dir(tmp_path):
@@ -59,3 +59,12 @@ def test_resolve_liveweb_run_config_hf_only_derives_latest_export(tmp_path):
     assert resolved["effective_load_checkpoint_dir"] == str(hf_export_dir.resolve())
     assert resolved["hf_only_load_dir"] == str(hf_export_dir.resolve())
     assert resolved["start_rollout_id_override"] == "8"
+
+
+def test_validate_resume_rollout_range_rejects_empty_range():
+    with pytest.raises(ValueError, match="Resume rollout range is empty"):
+        validate_resume_rollout_range(
+            start_rollout_id=3,
+            num_rollout=3,
+            resume_checkpoint_dir="/tmp/source/checkpoints",
+        )
