@@ -505,7 +505,14 @@ class MegatronTrainRayActor(TrainRayActor):
         log_perf_data(rollout_id, self.args)
 
     @timer
-    def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
+    def save_model(
+        self,
+        rollout_id: int,
+        force_sync: bool = False,
+        hf_export: bool = False,
+        save_mode: str = "full",
+        save_dir: str | None = None,
+    ) -> None:
         if self.args.debug_rollout_only:
             return
 
@@ -518,18 +525,50 @@ class MegatronTrainRayActor(TrainRayActor):
 
             maybe_finalize_async_save(blocking=True)
 
-        save(rollout_id, self.model, self.optimizer, self.opt_param_scheduler)
+        original_save = self.args.save
+        original_no_save_optim = getattr(self.args, "no_save_optim", False)
+        self.args.save = save_dir or original_save
+        self.args.no_save_optim = save_mode != "full"
+
+        if is_megatron_main_rank():
+            logger.info(
+                "save/checkpoint_begin rollout_id=%s save_mode=%s save_dir=%s no_save_optim=%s",
+                rollout_id,
+                save_mode,
+                self.args.save,
+                self.args.no_save_optim,
+            )
+        try:
+            save(rollout_id, self.model, self.optimizer, self.opt_param_scheduler)
+        finally:
+            self.args.save = original_save
+            self.args.no_save_optim = original_no_save_optim
+        if is_megatron_main_rank():
+            logger.info("save/checkpoint_end rollout_id=%s save_mode=%s", rollout_id, save_mode)
 
         if force_sync and self.args.async_save:
             maybe_finalize_async_save(blocking=True)
 
-        if self.args.save_hf is not None and self.role == "actor":
+        if hf_export and self.args.save_hf is not None and self.role == "actor":
             from slime.backends.megatron_utils.model import save_hf_model
 
+            if is_megatron_main_rank():
+                logger.info("save/hf_export_begin rollout_id=%s save_mode=%s", rollout_id, save_mode)
             save_hf_model(self.args, rollout_id, self.model)
+            if is_megatron_main_rank():
+                logger.info("save/hf_export_end rollout_id=%s save_mode=%s", rollout_id, save_mode)
 
         if self.args.offload_train:
             destroy_process_groups()
+
+    @timer
+    def prepare_for_save(self, save_mode: str = "full") -> None:
+        if self.args.debug_rollout_only:
+            return
+
+        print_memory(f"before prepare_for_save({save_mode})")
+        clear_memory(clear_host_memory=True)
+        print_memory(f"after prepare_for_save({save_mode})")
 
     @timer
     def update_weights(self) -> None:

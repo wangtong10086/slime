@@ -1,5 +1,7 @@
 import logging
+import os
 import socket
+from pathlib import Path
 
 import ray
 from ray.util.placement_group import placement_group
@@ -9,6 +11,47 @@ from .actor_group import RayTrainGroup
 from .rollout import RolloutManager
 
 logger = logging.getLogger(__name__)
+
+
+def _read_meminfo_kib() -> dict[str, int]:
+    meminfo: dict[str, int] = {}
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            parts = value.strip().split()
+            if not parts:
+                continue
+            meminfo[key] = int(parts[0])
+    except Exception:
+        return {}
+    return meminfo
+
+
+def log_startup_memory_snapshot(stage: str, *, ready_count: int | None = None) -> dict[str, float]:
+    meminfo = _read_meminfo_kib()
+    available_gb = meminfo.get("MemAvailable", 0) / 1024 / 1024
+    swap_total_gb = meminfo.get("SwapTotal", 0) / 1024 / 1024
+    swap_free_gb = meminfo.get("SwapFree", 0) / 1024 / 1024
+    swap_used_gb = max(0.0, swap_total_gb - swap_free_gb)
+    ray_threshold = float(os.environ.get("RAY_MEMORY_USAGE_THRESHOLD", "0.99"))
+
+    suffix = f", startup/train_actor_restore_ready_count={ready_count}" if ready_count is not None else ""
+    logger.info(
+        "%s: startup/host_mem_available_gb=%.2f, startup/swap_used_gb=%.2f, startup/ray_memory_threshold=%.3f%s",
+        stage,
+        available_gb,
+        swap_used_gb,
+        ray_threshold,
+        suffix,
+    )
+    return {
+        "startup/host_mem_available_gb": available_gb,
+        "startup/swap_used_gb": swap_used_gb,
+        "startup/ray_memory_threshold": ray_threshold,
+        "startup/train_actor_restore_ready_count": float(ready_count or 0),
+    }
 
 
 @ray.remote(num_gpus=1)
@@ -129,7 +172,16 @@ def allocate_train_group(args, num_nodes, num_gpus_per_node, pg):
     )
 
 
-def create_training_models(args, pgs, rollout_manager):
+def attach_rollout_manager_to_training_models(args, actor_model, critic_model, rollout_manager):
+    actor_model.set_rollout_manager(rollout_manager)
+    if args.use_critic:
+        critic_model.set_rollout_manager(rollout_manager)
+
+    if args.rollout_global_dataset:
+        ray.get(rollout_manager.load.remote(args.start_rollout_id - 1))
+
+
+def create_training_models(args, pgs, rollout_manager=None):
     actor_model = allocate_train_group(
         args=args,
         num_nodes=args.actor_num_nodes,
@@ -168,12 +220,8 @@ def create_training_models(args, pgs, rollout_manager):
     if args.start_rollout_id is None:
         args.start_rollout_id = start_rollout_ids[0]
 
-    actor_model.set_rollout_manager(rollout_manager)
-    if args.use_critic:
-        critic_model.set_rollout_manager(rollout_manager)
-
-    if args.rollout_global_dataset:
-        ray.get(rollout_manager.load.remote(args.start_rollout_id - 1))
+    if rollout_manager is not None:
+        attach_rollout_manager_to_training_models(args, actor_model, critic_model, rollout_manager)
 
     return actor_model, critic_model
 

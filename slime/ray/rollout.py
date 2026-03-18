@@ -339,10 +339,15 @@ class RolloutServer:
 
     def offload(self):
         """Release memory occupation across all groups (concurrent)."""
+        handles = self.offload_async()
+        return ray.get(handles) if handles else []
+
+    def offload_async(self):
+        """Release memory occupation across all groups without waiting."""
         handles = []
         for g in self.server_groups:
             handles.extend(g.offload())
-        return ray.get(handles) if handles else []
+        return handles
 
     def onload(self, tags: list[str] | None = None):
         """Resume memory occupation across all groups (concurrent)."""
@@ -409,6 +414,8 @@ class RolloutManager:
             self.servers = start_rollout_servers(args, pg)
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
         self.rollout_id = -1
+        self._save_quiesced = False
+        self._full_save_engine_handles: list[Any] = []
 
         self._health_monitors = []
         if not self.args.debug_train_only and self.args.use_fault_tolerance:
@@ -418,6 +425,7 @@ class RolloutManager:
                     monitor.start()
                     self._health_monitors.append(monitor)
             self._ci_fault_injection_pending = self.args.ci_test  # Flag for CI fault injection
+        self._full_save_quiesced = False
 
     def _try_ci_fault_injection(self):
         """Try to inject fault during generate (when health monitor is running)."""
@@ -512,8 +520,129 @@ class RolloutManager:
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=True)
         _log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
 
-    def save(self, rollout_id):
-        self.data_source.save(rollout_id)
+    def save(self, rollout_id, save_root=None):
+        self.data_source.save(rollout_id, save_root=save_root)
+
+    def _count_live_engines(self, engine_handles: list[Any], timeout_s: float = 3.0) -> int:
+        if not engine_handles:
+            return 0
+
+        refs = []
+        for engine in engine_handles:
+            try:
+                refs.append(engine.ping.remote())
+            except Exception:
+                continue
+        if not refs:
+            return 0
+        ready, remaining = ray.wait(refs, num_returns=len(refs), timeout=timeout_s)
+        live = 0
+        for ref in ready:
+            try:
+                ray.get(ref)
+                live += 1
+            except Exception:
+                continue
+        return live + len(remaining)
+
+    def get_save_status(self):
+        live_sglang_actor_count = 0
+        if self._full_save_quiesced:
+            live_sglang_actor_count = self._count_live_engines(self._full_save_engine_handles, timeout_s=1.0)
+        else:
+            live_sglang_actor_count = len([engine for engine in self.rollout_engines if engine is not None])
+        return {
+            "save_quiesced": self._save_quiesced or self._full_save_quiesced,
+            "full_save_quiesced": self._full_save_quiesced,
+            "live_sglang_actor_count": live_sglang_actor_count,
+            "live_rollout_actor_count": live_sglang_actor_count,
+            "num_servers": len(self.servers),
+        }
+
+    def begin_save_quiesce(self):
+        self.health_monitoring_pause()
+        timeout_s = float(os.environ.get("LIVEWEB_SAVE_QUIESCE_TIMEOUT_SECONDS", "60"))
+        handles = []
+        for srv in self.servers.values():
+            handles.extend(srv.offload_async())
+        if handles:
+            try:
+                ray.get(handles, timeout=timeout_s)
+            except Exception as exc:
+                logger.warning(
+                    "save/quiesce offload timed out after %.1fs; proceeding with best-effort quiesce (%s)",
+                    timeout_s,
+                    exc,
+                )
+        self._save_quiesced = True
+        status = self.get_save_status()
+        status.update({"save_mode": "archive", "num_engines": len(self.rollout_engines)})
+        return status
+
+    def end_save_quiesce(self):
+        if self._save_quiesced:
+            self.health_monitoring_resume()
+        self._save_quiesced = False
+        status = self.get_save_status()
+        status.update({"save_mode": "archive", "num_engines": len(self.rollout_engines)})
+        return status
+
+    def begin_full_save_quiesce(self):
+        self.health_monitoring_pause()
+        for monitor in self._health_monitors:
+            monitor.stop()
+        self._health_monitors = []
+        self._full_save_engine_handles = [engine for engine in self.rollout_engines if engine is not None]
+        timeout_s = float(os.environ.get("LIVEWEB_FULL_SAVE_SHUTDOWN_TIMEOUT_SECONDS", "180"))
+        handles = [engine.shutdown.remote() for engine in self._full_save_engine_handles]
+        if handles:
+            try:
+                ray.get(handles, timeout=timeout_s)
+            except Exception as exc:
+                logger.warning(
+                    "save/full_quiesce shutdown timed out after %.1fs; continuing with servers dropped (%s)",
+                    timeout_s,
+                    exc,
+                )
+        live_after_shutdown = self._count_live_engines(self._full_save_engine_handles, timeout_s=2.0)
+        if live_after_shutdown > 0:
+            logger.warning("save/full_quiesce found %s live rollout engines after shutdown; force-killing", live_after_shutdown)
+            for engine in self._full_save_engine_handles:
+                try:
+                    ray.kill(engine, no_restart=True)
+                except Exception:
+                    continue
+        live_after_kill = self._count_live_engines(self._full_save_engine_handles, timeout_s=2.0)
+        self.servers = {}
+        self._full_save_quiesced = True
+        return {
+            "save_quiesced": True,
+            "save_mode": "full",
+            "num_servers": 0,
+            "num_engines": 0,
+            "live_sglang_actor_count": live_after_kill,
+            "live_rollout_actor_count": live_after_kill,
+        }
+
+    def end_full_save_quiesce(self):
+        if self._full_save_quiesced:
+            self.servers = start_rollout_servers(self.args, self.pg)
+            if self.args.use_fault_tolerance:
+                for srv in self.servers.values():
+                    for group in srv.server_groups:
+                        monitor = RolloutHealthMonitor(group, self.args)
+                        monitor.start()
+                        self._health_monitors.append(monitor)
+            self._full_save_quiesced = False
+            self._full_save_engine_handles = []
+        return {
+            "save_quiesced": False,
+            "save_mode": "full",
+            "num_servers": len(self.servers),
+            "num_engines": len(self.rollout_engines),
+            "live_sglang_actor_count": len(self.rollout_engines),
+            "live_rollout_actor_count": len(self.rollout_engines),
+        }
 
     def load(self, rollout_id=None):
         self.data_source.load(rollout_id)
@@ -608,9 +737,19 @@ class RolloutManager:
             data = call_rollout_fn(self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False)
             metrics = data.metrics
             data = data.samples
+            if not data:
+                raise RuntimeError(
+                    "Rollout returned zero samples before training trim; "
+                    f"rollout_id={rollout_id}; metrics={metrics}"
+                )
             # flatten the data if it is a list of lists
             while isinstance(data[0], list):
                 data = list(itertools.chain.from_iterable(data))
+                if not data:
+                    raise RuntimeError(
+                        "Rollout returned zero samples after flattening train groups; "
+                        f"rollout_id={rollout_id}; metrics={metrics}"
+                    )
 
             if not self.args.disable_rollout_trim_samples and not self.args.debug_rollout_only:
                 requested_samples = len(data)

@@ -115,15 +115,27 @@ class RayTrainGroup:
         """Do one rollout training"""
         return [actor.train.remote(rollout_id, rollout_data_ref) for actor in self._actor_handlers]
 
-    def save_model(self, rollout_id, force_sync=False):
+    def save_model(self, rollout_id, force_sync=False, hf_export=False, save_mode="full", save_dir=None):
         """Save actor model"""
         batch_size = self._resolve_save_batch_size()
         results = []
         for start in range(0, len(self._actor_handlers), batch_size):
             chunk = self._actor_handlers[start : start + batch_size]
-            refs = [actor.save_model.remote(rollout_id, force_sync=force_sync) for actor in chunk]
+            refs = [
+                actor.save_model.remote(
+                    rollout_id,
+                    force_sync=force_sync,
+                    hf_export=hf_export,
+                    save_mode=save_mode,
+                    save_dir=save_dir,
+                )
+                for actor in chunk
+            ]
             results.extend(ray.get(refs))
         return results
+
+    def prepare_for_save(self, save_mode="full"):
+        return ray.get([actor.prepare_for_save.remote(save_mode=save_mode) for actor in self._actor_handlers])
 
     def _resolve_save_batch_size(self) -> int:
         requested_batch_size = max(1, int(os.environ.get("TRAIN_SAVE_BATCH_SIZE", "1")))

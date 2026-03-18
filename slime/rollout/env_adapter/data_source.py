@@ -46,8 +46,9 @@ class AdapterDataSource(DataSource):
     def add_samples(self, samples: list[list[Sample]]):
         return None
 
-    def save(self, rollout_id):
-        path = Path(self.args.save) / "rollout" / f"env_adapter_data_source_{rollout_id}.pt"
+    def save(self, rollout_id, save_root: str | None = None):
+        root = Path(save_root or self.args.save)
+        path = root / "rollout" / f"env_adapter_data_source_{rollout_id}.pt"
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {

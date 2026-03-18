@@ -365,6 +365,14 @@ class SGLangEngine(RayActor):
                 response.raise_for_status()
         kill_process_tree(self.process.pid)
 
+    def ping(self):
+        return {
+            "rank": self.rank,
+            "worker_type": self.worker_type,
+            "server_host": getattr(self, "server_host", None),
+            "server_port": getattr(self, "server_port", None),
+        }
+
     def get_weight_version(self):
         if self.node_rank != 0:
             return

@@ -28,7 +28,7 @@ class DataSource(abc.ABC):
         """
 
     @abc.abstractmethod
-    def save(self, rollout_id):
+    def save(self, rollout_id, save_root: str | None = None):
         """
         Save the state of the data source
         """
@@ -120,7 +120,7 @@ class RolloutDataSource(DataSource):
     def add_samples(self, samples: list[list[Sample]]):
         raise RuntimeError(f"Cannot add samples to {self.__class__.__name__}. This is a read-only data source.")
 
-    def save(self, rollout_id):
+    def save(self, rollout_id, save_root: str | None = None):
         if not self.args.rollout_global_dataset:
             return
 
@@ -131,7 +131,8 @@ class RolloutDataSource(DataSource):
             "sample_index": self.sample_index,
             "metadata": self.metadata,
         }
-        path = os.path.join(self.args.save, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
+        root = save_root or self.args.save
+        path = os.path.join(root, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save(state_dict, path)
 
