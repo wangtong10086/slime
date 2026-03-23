@@ -49,6 +49,10 @@ def get_args():
     args.use_distributed_optimizer = False
     args.no_save_optim = True
     args.no_save_rng = True
+    # Fully-parallel dist-ckpt save can stall in finalize for this tp4
+    # conversion path, leaving a half-written iter_0000001 without metadata.
+    # Use the regular torch_dist save path for reliable converter output.
+    args.ckpt_fully_parallel_save = False
 
     assert world_size <= args.num_layers, (
         f"World size {world_size} must be less than or equal to number of layers {args.num_layers}. "

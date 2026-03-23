@@ -121,3 +121,36 @@ def compute_rollout_step(args, rollout_id):
     if args.wandb_always_use_train_step:
         return rollout_id * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
     return rollout_id
+
+
+def summarize_task_count_metrics(
+    task_counts: list[int],
+    *,
+    valid_task_counts: tuple[int, ...] = (1, 2, 3, 4),
+) -> dict[str, float]:
+    """Summarize task-count metrics with a normalized known-task distribution.
+
+    `num_tasks_n_rate` should describe the distribution across samples whose task
+    count is known, so the rates sum to 1 when at least one valid count is
+    present. We additionally expose `unknown_rate` over the original sample
+    count so missing/invalid values remain visible.
+    """
+
+    if not task_counts:
+        metrics = {"mean_num_tasks": 0.0, "num_tasks_unknown_rate": 0.0}
+        for task_count in valid_task_counts:
+            metrics[f"num_tasks_{task_count}_rate"] = 0.0
+        return metrics
+
+    valid_counts = [count for count in task_counts if count in valid_task_counts]
+    total_valid = len(valid_counts)
+    total_all = len(task_counts)
+    metrics = {
+        "mean_num_tasks": (sum(valid_counts) / total_valid) if total_valid else 0.0,
+        "num_tasks_unknown_rate": (total_all - total_valid) / total_all,
+    }
+    for task_count in valid_task_counts:
+        metrics[f"num_tasks_{task_count}_rate"] = (
+            valid_counts.count(task_count) / total_valid if total_valid else 0.0
+        )
+    return metrics

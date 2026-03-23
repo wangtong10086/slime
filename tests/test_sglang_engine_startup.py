@@ -3,6 +3,8 @@ import sys
 import types
 from types import SimpleNamespace
 
+import requests
+
 
 def _install_fake_sglang_engine_deps(monkeypatch):
     fake_router = types.ModuleType("sglang_router")
@@ -32,6 +34,7 @@ def _install_fake_sglang_engine_deps(monkeypatch):
         enable_return_routed_experts: bool = False
         dtype: str | None = None
         mem_fraction_static: float | None = None
+        api_key: str | None = None
         disaggregation_mode: str = "null"
         load_balance_method: str | None = None
         disaggregation_bootstrap_port: int | None = None
@@ -134,3 +137,163 @@ def test_compute_server_args_keeps_hf_model_for_frozen_group(monkeypatch):
 
     assert kwargs["model_path"] == "/models/base"
     assert "update_weights" not in kwargs
+
+
+def test_resolve_sglang_control_timeout_seconds_defaults(monkeypatch):
+    _install_fake_sglang_engine_deps(monkeypatch)
+    sys.modules.pop("slime.backends.sglang_utils.sglang_engine", None)
+    from slime.backends.sglang_utils.sglang_engine import resolve_sglang_control_timeout_seconds
+
+    monkeypatch.delenv("LIVEWEB_SGLANG_CONTROL_TIMEOUT_SECONDS", raising=False)
+    assert resolve_sglang_control_timeout_seconds() == 60.0
+
+    monkeypatch.setenv("LIVEWEB_SGLANG_CONTROL_TIMEOUT_SECONDS", "17.5")
+    assert resolve_sglang_control_timeout_seconds() == 17.5
+
+
+def test_make_request_uses_control_timeout(monkeypatch):
+    _install_fake_sglang_engine_deps(monkeypatch)
+    sys.modules.pop("slime.backends.sglang_utils.sglang_engine", None)
+    import slime.backends.sglang_utils.sglang_engine as engine_mod
+
+    captured: dict[str, object] = {}
+
+    class _FakeResponse:
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"ok": True}
+
+    class _FakeSession:
+        trust_env = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json=None, headers=None, timeout=None):
+            captured["url"] = url
+            captured["json"] = json
+            captured["headers"] = headers
+            captured["timeout"] = timeout
+            return _FakeResponse()
+
+    monkeypatch.setenv("LIVEWEB_SGLANG_CONTROL_TIMEOUT_SECONDS", "23")
+    monkeypatch.setattr(engine_mod, "_build_requests_session", lambda _url: _FakeSession())
+
+    engine = object.__new__(engine_mod.SGLangEngine)
+    engine.node_rank = 0
+    engine.server_host = "127.0.0.1"
+    engine.server_port = 18000
+    engine.server_api_key = "local-liveweb"
+
+    result = engine._make_request("resume_memory_occupation", {"tags": ["weights"]})
+
+    assert result == {"ok": True}
+    assert captured["timeout"] == 23.0
+    assert captured["url"] == "http://127.0.0.1:18000/resume_memory_occupation"
+
+
+def test_make_request_timeout_adds_endpoint_context(monkeypatch):
+    _install_fake_sglang_engine_deps(monkeypatch)
+    sys.modules.pop("slime.backends.sglang_utils.sglang_engine", None)
+    import slime.backends.sglang_utils.sglang_engine as engine_mod
+
+    class _FakeSession:
+        trust_env = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json=None, headers=None, timeout=None):
+            raise requests.exceptions.Timeout("timed out")
+
+    monkeypatch.setenv("LIVEWEB_SGLANG_CONTROL_TIMEOUT_SECONDS", "5")
+    monkeypatch.setattr(engine_mod, "_build_requests_session", lambda _url: _FakeSession())
+
+    engine = object.__new__(engine_mod.SGLangEngine)
+    engine.node_rank = 0
+    engine.server_host = "127.0.0.1"
+    engine.server_port = 18001
+    engine.server_api_key = None
+
+    try:
+        engine._make_request("resume_memory_occupation", {"tags": ["weights"]})
+    except requests.exceptions.Timeout as exc:
+        notes = getattr(exc, "__notes__", [])
+        assert any("resume_memory_occupation" in note for note in notes)
+        assert any("timeout=5.0" in note for note in notes)
+    else:
+        raise AssertionError("expected timeout")
+
+
+def test_init_normal_registers_worker_with_router_auth_headers(monkeypatch):
+    _install_fake_sglang_engine_deps(monkeypatch)
+    sys.modules.pop("slime.backends.sglang_utils.sglang_engine", None)
+    import slime.backends.sglang_utils.sglang_engine as engine_mod
+
+    captured: dict[str, object] = {}
+
+    class _FakeResponse:
+        status_code = 200
+
+        def __init__(self, request_url="http://127.0.0.1:3572/workers"):
+            self.request = SimpleNamespace(url=request_url)
+
+        def raise_for_status(self):
+            return None
+
+    class _FakeSession:
+        trust_env = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json=None, headers=None, timeout=None):
+            captured["url"] = url
+            captured["json"] = json
+            captured["headers"] = headers
+            return _FakeResponse(url)
+
+    monkeypatch.setattr(engine_mod, "_build_requests_session", lambda _url: _FakeSession())
+    monkeypatch.setattr(engine_mod, "launch_server_process", lambda _args: SimpleNamespace(pid=12345))
+
+    engine = object.__new__(engine_mod.SGLangEngine)
+    engine.node_rank = 0
+    engine.router_ip = "127.0.0.1"
+    engine.router_port = 3572
+    engine.server_host = "127.0.0.1"
+    engine.server_port = 15000
+    engine.server_api_key = "local-liveweb"
+    engine.worker_type = "regular"
+    engine.args = SimpleNamespace(use_slime_router=False)
+
+    engine._init_normal(
+        {
+            "host": "127.0.0.1",
+            "port": 15000,
+            "api_key": "local-liveweb",
+        }
+    )
+
+    assert captured["url"] == "http://127.0.0.1:3572/workers"
+    assert captured["headers"] == {
+        "Content-Type": "application/json; charset=utf-8",
+        "Authorization": "Bearer local-liveweb",
+    }
+    assert captured["json"] == {
+        "url": "http://127.0.0.1:15000",
+        "worker_type": "regular",
+        "api_key": "local-liveweb",
+    }

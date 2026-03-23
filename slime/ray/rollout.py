@@ -205,6 +205,9 @@ class ServerGroup:
                     "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
                 }.items()
             }
+            rollout_alloc_conf = os.environ.get("LIVEWEB_ROLLOUT_PYTORCH_CUDA_ALLOC_CONF", "").strip()
+            if rollout_alloc_conf:
+                env_vars["PYTORCH_CUDA_ALLOC_CONF"] = rollout_alloc_conf
 
             rollout_engine = RolloutRayActor.options(
                 num_cpus=num_cpus,
@@ -1375,6 +1378,7 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     else:
         from sglang_router.launch_router import RouterArgs
 
+        from slime.backends.sglang_utils.control_plane import resolve_control_plane_api_key
         from slime.utils.http_utils import run_router
 
         router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
@@ -1383,6 +1387,12 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
         router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
         router_args.log_level = "warn"
         router_args.request_timeout_secs = args.sglang_router_request_timeout_secs
+        control_plane_api_key = resolve_control_plane_api_key(args)
+        if control_plane_api_key:
+            router_args.api_key = control_plane_api_key
+            router_args.control_plane_api_keys = [
+                ("local-liveweb", "LiveWeb Local Control Plane", control_plane_api_key, "admin")
+            ]
 
         if has_pd_disaggregation:
             router_args.pd_disaggregation = True

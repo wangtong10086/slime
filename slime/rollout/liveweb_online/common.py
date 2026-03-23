@@ -14,6 +14,14 @@ from urllib.parse import urlparse
 
 import requests
 
+from slime.backends.sglang_utils.control_plane import build_control_plane_headers
+from slime.utils.toolcall_health import (
+    TOOLCALL_FORMAT_DANGLING_CLOSING,
+    TOOLCALL_FORMAT_TEXT_ONLY_JSON,
+    classify_toolcall_output,
+    extract_assistant_response_text,
+    preserve_structured_conversation,
+)
 from slime.utils.processing_utils import load_tokenizer
 from slime.utils.types import Sample
 
@@ -27,7 +35,20 @@ from .task_sampling import (
     stable_plugin_allowlist,
 )
 
-ENV_POLLUTION_FAILURES = {"site_unreachable", "cache_error", "llm_error", "rollout_exception"}
+ENV_POLLUTION_FAILURES = {
+    "site_unreachable",
+    "cache_error",
+    "llm_error",
+    "rollout_exception",
+    "prefetch_failed",
+    "cache_fill_failed",
+    "env_nav_timeout",
+    "env_cdn_blocked",
+    "challenge_page",
+    "control_plane_auth_failure",
+    "sample_wall_timeout",
+    "group_wall_timeout",
+}
 FORMAT_FAILURE_REASONS = {"parse_failed", "invalid_tool_format"}
 PROGRESS_SHAPING_SIGNALS = {"target_asset", "detail_page_visit", "all_targets"}
 DEFAULT_PREWARM_URLS = {
@@ -43,11 +64,187 @@ DEFAULT_PREWARM_URLS = {
     ],
 }
 
+GOOGLE_FAMILY_HOST_MARKERS = (
+    "google.",
+    "googleusercontent.com",
+    "gstatic.com",
+)
+
+
+def _normalize_url_for_matching(url: str | None) -> str:
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.netloc or parsed.path or "").lower().strip("/")
+    path = (parsed.path or "").rstrip("/")
+    if not host:
+        return ""
+    return f"{scheme}://{host}{path}" if scheme else f"{host}{path}"
+
+
+def _hostname_from_url(url: str | None) -> str:
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    if parsed.netloc:
+        return parsed.netloc.lower()
+    if parsed.scheme:
+        return ""
+    return parsed.path.lower().split("/", 1)[0]
+
+
+def _host_matches_domain(host: str, domain: str) -> bool:
+    host = (host or "").lower()
+    domain = (domain or "").lower().strip()
+    if not host or not domain:
+        return False
+    return host == domain or host.endswith(f".{domain}")
+
+
+def _host_in_domains(host: str, domains: set[str] | list[str] | tuple[str, ...]) -> bool:
+    domain_set = {str(domain).lower() for domain in domains or []}
+    return any(_host_matches_domain(host, domain) for domain in domain_set)
+
+
+def _is_google_family_host(host: str) -> bool:
+    host = (host or "").lower()
+    return any(marker in host for marker in GOOGLE_FAMILY_HOST_MARKERS)
+
+
+def _extract_trajectory_diagnostics(
+    *,
+    trajectory: list[Any],
+    allowed_domains: set[str] | list[str],
+    required_domains: set[str] | list[str],
+) -> dict[str, Any]:
+    allowed_domain_set = {str(domain).lower() for domain in allowed_domains or []}
+    required_domain_set = {str(domain).lower() for domain in required_domains or []}
+    observation_urls: list[str] = []
+    observation_hosts: list[str] = []
+    disallowed_domain_hits = 0
+    google_family_offdomain_count = 0
+    repeated_url_count = 0
+    same_page_loop_count = 0
+    offdomain_persist_count = 0
+    goto_count = 0
+    goto_hosts: list[str] = []
+    required_domain_hits = 0
+    required_domains_hit: set[str] = set()
+    last_norm = ""
+    last_host = ""
+    same_url_streak = 0
+    offdomain_host_streak = 0
+
+    for step in trajectory:
+        observation = getattr(step, "observation", None)
+        url = getattr(observation, "url", None) or ""
+        norm_url = _normalize_url_for_matching(url)
+        host = _hostname_from_url(url)
+        if norm_url:
+            observation_urls.append(norm_url)
+        if host:
+            observation_hosts.append(host)
+            if _host_in_domains(host, required_domain_set):
+                required_domain_hits += 1
+                required_domains_hit.update(
+                    domain for domain in required_domain_set if _host_matches_domain(host, domain)
+                )
+            allowed_hit = _host_in_domains(host, allowed_domain_set)
+            if not allowed_hit:
+                disallowed_domain_hits += 1
+                if _is_google_family_host(host):
+                    google_family_offdomain_count += 1
+            if not allowed_hit and host == last_host:
+                offdomain_host_streak += 1
+            else:
+                offdomain_host_streak = 1 if (host and not allowed_hit) else 0
+            if offdomain_host_streak >= 2:
+                offdomain_persist_count += 1
+        if norm_url and norm_url == last_norm:
+            repeated_url_count += 1
+            same_url_streak += 1
+        else:
+            same_url_streak = 1 if norm_url else 0
+        if same_url_streak >= 3:
+            same_page_loop_count += 1
+        last_norm = norm_url
+        last_host = host
+
+        action = getattr(step, "action", None)
+        action_type = getattr(action, "action_type", None)
+        if action_type == "goto":
+            goto_count += 1
+            target_url = getattr(action, "url", None) or ""
+            target_host = _hostname_from_url(target_url)
+            if target_host:
+                goto_hosts.append(target_host)
+
+    final_url = observation_urls[-1] if observation_urls else ""
+    final_host = observation_hosts[-1] if observation_hosts else ""
+    return {
+        "goto_count": goto_count,
+        "goto_hosts": goto_hosts,
+        "disallowed_domain_hits": disallowed_domain_hits,
+        "google_family_offdomain_count": google_family_offdomain_count,
+        "repeated_url_count": repeated_url_count,
+        "same_page_loop_count": same_page_loop_count,
+        "offdomain_persist_count": offdomain_persist_count,
+        "required_domain_hits": required_domain_hits,
+        "required_domains_hit": sorted(required_domains_hit),
+        "final_host": final_host,
+        "final_google_search": bool(final_host and _is_google_family_host(final_host) and "search" in final_url),
+    }
+
+
+def _count_hallucinated_plugins(answer_details: list[dict[str, Any]], visited_domains: set[str]) -> int:
+    hallucinated = 0
+    for detail in answer_details:
+        if not _answer_is_present(detail.get("actual")):
+            continue
+        plugin_domains = {str(domain).lower() for domain in detail.get("required_domains") or []}
+        if plugin_domains and not any(_host_in_domains(domain, visited_domains) for domain in plugin_domains):
+            hallucinated += 1
+    return hallucinated
+
+
+def _classify_rl_failure_bucket(
+    *,
+    failure_reason: str | None,
+    success: bool,
+    score: float,
+    progress_summary: dict[str, Any],
+    unsupported_stop: bool,
+    hallucinated_plugin_count: int,
+    trajectory_diagnostics: dict[str, Any],
+) -> str:
+    if failure_reason in ENV_POLLUTION_FAILURES:
+        return "environment_failure"
+    if failure_reason in FORMAT_FAILURE_REASONS:
+        return "format_failure"
+    if success:
+        return "success"
+    if unsupported_stop or hallucinated_plugin_count > 0:
+        return "premature_stop"
+    if (
+        trajectory_diagnostics.get("google_family_offdomain_count", 0) >= 2
+        or trajectory_diagnostics.get("disallowed_domain_hits", 0) >= 3
+        or trajectory_diagnostics.get("same_page_loop_count", 0) >= 2
+        or trajectory_diagnostics.get("offdomain_persist_count", 0) >= 2
+        or trajectory_diagnostics.get("final_google_search")
+    ):
+        return "wrong_domain_loop"
+    if score >= 0.3 or float(progress_summary.get("progress_score", 0.0)) >= float(
+        os.getenv("LIVEWEB_NEAR_MISS_PROGRESS_THRESHOLD", "0.35")
+    ):
+        return "near_miss"
+    return "wrong_path"
+
 
 def get_phase_name(evaluation: bool = False) -> str:
     if evaluation:
-        return os.getenv("LIVEWEB_EVAL_PHASE", "main")
-    return os.getenv("LIVEWEB_TASK_MIX_PHASE", "warmup")
+        return os.getenv("LIVEWEB_EVAL_PHASE", "online_align")
+    return os.getenv("LIVEWEB_TASK_MIX_PHASE", "bootstrap")
 
 
 def derive_llm_seed(task_seed: int, sample_index: int) -> int:
@@ -84,6 +281,7 @@ class PromptJob:
     combo_key: str
     phase: str
     route_key: str
+    failure_bucket: str | None = None
 
     def to_metadata(self) -> dict[str, Any]:
         return {
@@ -100,6 +298,7 @@ class PromptJob:
             "combo_index": self.combo_index,
             "combo_key": self.combo_key,
             "phase": self.phase,
+            "failure_bucket": self.failure_bucket,
             "route_key": self.route_key,
         }
 
@@ -136,6 +335,7 @@ def build_prompt_job(
         combo_index=int(selection["combo_index"]),
         combo_key=combo_key,
         phase=phase,
+        failure_bucket=str(selection.get("failure_bucket") or ""),
         route_key=derive_route_key(
             f"{phase}:task",
             int(selection["task_id"]),
@@ -178,6 +378,7 @@ def build_eval_jobs(
                 combo_index=int(selection["combo_index"]),
                 combo_key=str(selection["combo_key"]),
                 phase=phase,
+                failure_bucket=str(selection.get("failure_bucket") or ""),
                 route_key=derive_route_key(
                     f"eval:{dataset_name}",
                     int(selection["task_id"]),
@@ -200,8 +401,8 @@ def read_int_env(name: str, default: int) -> int:
 def get_eval_profile(rollout_id: int) -> tuple[str, int, str]:
     formal_every = read_int_env("LIVEWEB_FORMAL_EVAL_EVERY", 50)
     if (rollout_id + 1) % formal_every == 0:
-        return "formal_eval", read_int_env("LIVEWEB_FORMAL_EVAL_PROMPTS", 200), "main"
-    return "quick_eval", read_int_env("LIVEWEB_QUICK_EVAL_PROMPTS", 32), "warmup"
+        return "formal_eval", read_int_env("LIVEWEB_FORMAL_EVAL_PROMPTS", 200), "online_align"
+    return "quick_eval", read_int_env("LIVEWEB_QUICK_EVAL_PROMPTS", 32), "bootstrap"
 
 
 def summarize_cache_stats(cache_stats_list: list[dict[str, Any]]) -> dict[str, float]:
@@ -225,7 +426,11 @@ def discover_worker_urls(args) -> list[str]:
     router_base = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
     session = requests.Session()
     session.trust_env = not _should_bypass_proxy(router_base)
-    response = session.get(f"{router_base}/list_workers", timeout=15)
+    response = session.get(
+        f"{router_base}/list_workers",
+        timeout=15,
+        headers=build_control_plane_headers(args),
+    )
     response.raise_for_status()
     payload = response.json()
     urls = payload.get("urls") or payload.get("worker_urls") or []
@@ -235,13 +440,41 @@ def discover_worker_urls(args) -> list[str]:
 
 
 def is_environment_pollution(result: dict[str, Any]) -> bool:
-    failure_reason = (result.get("extra") or {}).get("failure_reason")
-    return failure_reason in ENV_POLLUTION_FAILURES
+    return classify_environment_failure(result) is not None
 
 
 def classify_environment_failure(result: dict[str, Any]) -> str | None:
-    failure_reason = (result.get("extra") or {}).get("failure_reason")
-    return failure_reason if failure_reason in ENV_POLLUTION_FAILURES else None
+    extra = result.get("extra") or {}
+    error_lower = str(result.get("error") or "").lower()
+    failure_reason = str(extra.get("failure_reason") or "")
+    if any(marker in error_lower for marker in ("challenge page", "captcha", "just a moment")):
+        return "challenge_page"
+    if "401 unauthorized" in error_lower or "403 forbidden" in error_lower:
+        return "control_plane_auth_failure"
+    reachability = extra.get("reachability_audit") or {}
+    classification = reachability.get("classification")
+    if classification in ENV_POLLUTION_FAILURES:
+        return str(classification)
+    if failure_reason in ENV_POLLUTION_FAILURES:
+        return failure_reason
+    return None
+
+
+def classify_overflow_failure(result: dict[str, Any]) -> str | None:
+    extra = result.get("extra") or {}
+    failure_reason = str(extra.get("failure_reason") or "")
+    error_lower = str(result.get("error") or "").lower()
+    if failure_reason in {"format_recovery_overflow", "llm_context_overflow"}:
+        return failure_reason
+    if "recoverable_context_overflow" in error_lower:
+        return "format_recovery_overflow"
+    if "strict-serial format recovery error" in error_lower and "context length" in error_lower:
+        return "format_recovery_overflow"
+    if "requested token count exceeds the model's maximum context length" in error_lower:
+        return "llm_context_overflow"
+    if "longer than the model's context length" in error_lower:
+        return "llm_context_overflow"
+    return None
 
 
 def _answer_is_present(value: Any) -> bool:
@@ -374,6 +607,32 @@ def _aligned_collected_asset_snapshots(
 def compute_reward_from_result(result: dict[str, Any]) -> tuple[float | None, dict[str, Any]]:
     extra = result.get("extra") or {}
     failure_reason = extra.get("failure_reason")
+    overflow_failure = classify_overflow_failure(result)
+    if overflow_failure is not None:
+        learning_bucket = "format_failure" if overflow_failure == "format_recovery_overflow" else "wrong_path"
+        return None, {
+            "drop_reason": overflow_failure,
+            "environment_failure_type": None,
+            "raw_reward": result.get("score", 0.0),
+            "learning_bucket": learning_bucket,
+            "rl_failure_bucket": overflow_failure,
+        }
+    malformed_toolcall_output = False
+    if os.getenv("LIVEWEB_DROP_INVALID_TOOLCALL_OUTPUTS", "1") == "1" and failure_reason == "parse_failed":
+        raw_preview = extra.get("raw_response_preview") or extra.get("last_action_raw") or ""
+        output_class = classify_toolcall_output(content=raw_preview, tool_calls=extra.get("tool_calls_preview"))
+        malformed_toolcall_output = output_class in {
+            TOOLCALL_FORMAT_DANGLING_CLOSING,
+            TOOLCALL_FORMAT_TEXT_ONLY_JSON,
+        }
+        if malformed_toolcall_output:
+            return None, {
+                "drop_reason": "invalid_toolcall_output",
+                "environment_failure_type": None,
+                "raw_reward": result.get("score", 0.0),
+                "learning_bucket": "format_failure",
+                "toolcall_output_class": output_class,
+            }
     environment_failure_type = classify_environment_failure(result)
     answer_details = extra.get("answer_details") or []
     progress_summary = extra.get("progress_summary")
@@ -388,6 +647,40 @@ def compute_reward_from_result(result: dict[str, Any]) -> tuple[float | None, di
             answer_slots_total=extra.get("answer_slots_total"),
             num_subtasks=extra.get("num_subtasks"),
         )
+    visited_domains = {str(domain).lower() for domain in extra.get("visited_domains") or []}
+    trajectory_diagnostics = dict(extra.get("trajectory_diagnostics") or {})
+    if not trajectory_diagnostics:
+        trajectory_diagnostics = {
+            "disallowed_domain_hits": 0,
+            "google_family_offdomain_count": 0,
+            "repeated_url_count": 0,
+            "same_page_loop_count": 0,
+            "offdomain_persist_count": 0,
+            "required_domain_hits": 0,
+            "required_domains_hit": [],
+            "final_host": "",
+            "final_google_search": False,
+        }
+    unsupported_stop = bool(
+        extra.get("unsupported_stop")
+        or (
+            failure_reason in {None, "incomplete_data"}
+            and (
+                (
+                    int(progress_summary.get("required_domains_total", 0)) > 0
+                    and float(progress_summary.get("required_domain_coverage", 0.0)) < 1.0
+                )
+                or (
+                    int(progress_summary.get("target_assets_total", 0)) > 0
+                    and float(progress_summary.get("confirmed_target_coverage", 0.0)) < 1.0
+                )
+            )
+        )
+    )
+    hallucinated_plugin_count = int(
+        extra.get("hallucinated_plugin_count")
+        or _count_hallucinated_plugins(answer_details, visited_domains)
+    )
     learning_bucket = str(
         extra.get("learning_bucket")
         or classify_learning_bucket(
@@ -397,60 +690,102 @@ def compute_reward_from_result(result: dict[str, Any]) -> tuple[float | None, di
             progress_score=float(progress_summary.get("progress_score", 0.0)),
         )
     )
+    rl_failure_bucket = str(
+        extra.get("rl_failure_bucket")
+        or _classify_rl_failure_bucket(
+            failure_reason=failure_reason,
+            success=bool(result.get("success", False)),
+            score=float(result.get("score", 0.0)),
+            progress_summary=progress_summary,
+            unsupported_stop=unsupported_stop,
+            hallucinated_plugin_count=hallucinated_plugin_count,
+            trajectory_diagnostics=trajectory_diagnostics,
+        )
+    )
     if environment_failure_type is not None:
         return None, {
             "drop_reason": environment_failure_type,
             "environment_failure_type": environment_failure_type,
             "raw_reward": result.get("score", 0.0),
             "learning_bucket": learning_bucket,
+            "rl_failure_bucket": rl_failure_bucket,
             "progress_summary": progress_summary,
             **progress_summary,
         }
 
     final_score = float(result.get("score", 0.0))
-    shaping = 0.0
-
-    required_domains = set(extra.get("required_domains") or [])
-    visited_domains = set(extra.get("visited_domains") or [])
-    if required_domains:
-        visited_required = int(progress_summary.get("required_domains_visited", 0))
-        shaping += min(0.06, 0.02 * visited_required)
-        if visited_required >= 2 and final_score > 0.0:
-            shaping += 0.03
-
-    valid_answers = int(progress_summary.get("valid_answers", 0))
-    shaping += min(0.05, 0.01 * valid_answers)
-
-    if os.getenv("LIVEWEB_ENABLE_PROGRESS_SHAPING", "1") == "1":
-        target_progress_signal_total = _sum_positive_step_signals(
-            (result.get("rewards") or {}).get("step_rewards") or [],
-            PROGRESS_SHAPING_SIGNALS,
-        )
-        shaping += min(0.05, 0.2 * target_progress_signal_total)
-
-    if failure_reason == "parse_failed":
-        shaping -= 0.10
+    required_domains = {str(domain).lower() for domain in extra.get("required_domains") or []}
+    terminal_reward = final_score
     if failure_reason == "max_steps_reached":
-        shaping -= 0.05
-    if failure_reason is None and required_domains and not required_domains.issubset(visited_domains):
-        shaping -= 0.05
+        terminal_reward -= float(os.getenv("LIVEWEB_RL_TRUNCATION_PENALTY", "0.20"))
+    if unsupported_stop:
+        terminal_reward -= float(os.getenv("LIVEWEB_RL_UNSUPPORTED_STOP_PENALTY", "0.20"))
+    if hallucinated_plugin_count:
+        terminal_reward -= min(
+            float(os.getenv("LIVEWEB_RL_MAX_HALLUCINATION_PENALTY", "0.40")),
+            float(os.getenv("LIVEWEB_RL_HALLUCINATION_PLUGIN_PENALTY", "0.10")) * hallucinated_plugin_count,
+        )
 
+    shaping = 0.0
+    if int(progress_summary.get("required_domains_visited", 0)) > 0:
+        shaping += float(os.getenv("LIVEWEB_RL_FIRST_REQUIRED_DOMAIN_REWARD", "0.08"))
+    if int(progress_summary.get("target_assets_collected", 0)) > 0:
+        shaping += float(os.getenv("LIVEWEB_RL_FIRST_TARGET_ASSET_REWARD", "0.10"))
+    if int(progress_summary.get("confirmed_targets_collected", 0)) > 0:
+        shaping += float(os.getenv("LIVEWEB_RL_FIRST_DETAIL_PAGE_REWARD", "0.05"))
+
+    shaping -= min(
+        float(os.getenv("LIVEWEB_RL_MAX_REPEATED_URL_PENALTY", "0.24")),
+        float(os.getenv("LIVEWEB_RL_REPEATED_URL_PENALTY", "0.08"))
+        * float(trajectory_diagnostics.get("repeated_url_count", 0)),
+    )
     no_progress_steps = 0
     for step_reward in (result.get("rewards") or {}).get("step_rewards") or []:
         for signal in step_reward.get("signals") or []:
             if signal.get("signal") == "no_progress":
                 no_progress_steps += 1
-    shaping -= min(0.05, 0.01 * no_progress_steps)
+    shaping -= min(
+        float(os.getenv("LIVEWEB_RL_MAX_NO_PROGRESS_PENALTY", "0.20")),
+        float(os.getenv("LIVEWEB_RL_NO_PROGRESS_PENALTY", "0.05")) * no_progress_steps,
+    )
+    shaping -= min(
+        float(os.getenv("LIVEWEB_RL_MAX_OFFDOMAIN_PENALTY", "0.30")),
+        float(os.getenv("LIVEWEB_RL_OFFDOMAIN_PERSIST_PENALTY", "0.10"))
+        * float(trajectory_diagnostics.get("offdomain_persist_count", 0)),
+    )
+    shaping -= min(
+        float(os.getenv("LIVEWEB_RL_MAX_GOOGLE_PENALTY", "0.30")),
+        float(os.getenv("LIVEWEB_RL_GOOGLE_FAMILY_PENALTY", "0.15"))
+        * float(trajectory_diagnostics.get("google_family_offdomain_count", 0)),
+    )
+    shaping -= min(
+        float(os.getenv("LIVEWEB_RL_MAX_SAME_PAGE_LOOP_PENALTY", "0.30")),
+        float(os.getenv("LIVEWEB_RL_SAME_PAGE_LOOP_PENALTY", "0.12"))
+        * float(trajectory_diagnostics.get("same_page_loop_count", 0)),
+    )
+    if failure_reason == "parse_failed":
+        shaping -= float(os.getenv("LIVEWEB_RL_PARSE_FAILED_PENALTY", "0.10"))
+    if (
+        int(progress_summary.get("required_domains_total", 0)) > 0
+        and float(progress_summary.get("required_domain_coverage", 0.0)) >= 1.0
+        and not bool(result.get("success", False))
+    ):
+        shaping += float(os.getenv("LIVEWEB_RL_ALL_REQUIRED_DOMAINS_COVERED_REWARD", "0.05"))
 
-    shaping = min(0.15, max(-0.15, shaping))
-    reward = min(1.0, max(-0.15, final_score + shaping))
+    shaping = min(0.40, max(-0.85, shaping))
+    reward = min(1.0, max(-1.0, terminal_reward + shaping))
     return reward, {
         "drop_reason": None,
         "environment_failure_type": None,
         "raw_reward": final_score,
         "final_score": final_score,
+        "terminal_reward": terminal_reward,
         "shaping_reward": shaping,
         "learning_bucket": learning_bucket,
+        "rl_failure_bucket": rl_failure_bucket,
+        "unsupported_stop": unsupported_stop,
+        "hallucinated_plugin_count": hallucinated_plugin_count,
+        "trajectory_diagnostics": trajectory_diagnostics,
         "progress_summary": progress_summary,
         **progress_summary,
     }
@@ -460,56 +795,8 @@ def should_allow_environment_fallback() -> bool:
     return os.getenv("LIVEWEB_ALLOW_ENV_FALLBACK_GROUPS", "0") == "1"
 
 
-def extract_assistant_response_text(conversation: list[dict[str, Any]]) -> str:
-    parts: list[str] = []
-    for message in conversation:
-        if message.get("role") != "assistant":
-            continue
-        if isinstance(message.get("content"), str) and message["content"]:
-            parts.append(message["content"])
-            continue
-        for tool_call in message.get("tool_calls") or []:
-            function = tool_call.get("function", {})
-            parts.append(
-                json.dumps(
-                    {
-                        "name": function.get("name"),
-                        "arguments": function.get("arguments"),
-                    },
-                    ensure_ascii=False,
-                )
-            )
-    return "\n".join(parts)
-
-
-def _assistant_message_training_text(message: dict[str, Any]) -> str:
-    parts: list[str] = []
-    if isinstance(message.get("content"), str) and message["content"]:
-        parts.append(message["content"])
-    for tool_call in message.get("tool_calls") or []:
-        function = tool_call.get("function", {})
-        parts.append(
-            json.dumps(
-                {
-                    "name": function.get("name"),
-                    "arguments": function.get("arguments"),
-                },
-                ensure_ascii=False,
-            )
-        )
-    return "\n".join(parts)
-
-
 def normalize_conversation_for_training(conversation: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    normalized: list[dict[str, Any]] = []
-    for message in conversation:
-        msg = dict(message)
-        if msg.get("role") == "assistant":
-            training_text = _assistant_message_training_text(msg)
-            if training_text:
-                msg["content"] = training_text
-        normalized.append(msg)
-    return normalized
+    return preserve_structured_conversation(conversation)
 
 
 def _normalize_token_ids(encoded: Any) -> list[int]:
@@ -628,6 +915,14 @@ def make_sample_from_result(
         "confirmed_targets": (result.get("extra") or {}).get("confirmed_targets") or [],
         "progress_summary": (result.get("extra") or {}).get("progress_summary") or reward_meta.get("progress_summary") or {},
         "learning_bucket": (result.get("extra") or {}).get("learning_bucket") or reward_meta.get("learning_bucket"),
+        "rl_failure_bucket": (result.get("extra") or {}).get("rl_failure_bucket") or reward_meta.get("rl_failure_bucket"),
+        "unsupported_stop": (result.get("extra") or {}).get("unsupported_stop", reward_meta.get("unsupported_stop")),
+        "hallucinated_plugin_count": (result.get("extra") or {}).get(
+            "hallucinated_plugin_count", reward_meta.get("hallucinated_plugin_count", 0)
+        ),
+        "trajectory_diagnostics": (result.get("extra") or {}).get("trajectory_diagnostics")
+        or reward_meta.get("trajectory_diagnostics")
+        or {},
     }
     usage = sample.metadata["usage"]
     sample.metadata["prompt_tokens"] = usage.get("prompt_tokens", 0)
@@ -814,6 +1109,17 @@ def format_recovery_extra(agent_loop: Any | None) -> dict[str, Any]:
     return stats if isinstance(stats, dict) else {}
 
 
+def _cleanup_interceptor_value(interceptor: Any) -> None:
+    if interceptor is None:
+        return
+    target = interceptor
+    if isinstance(interceptor, tuple) and len(interceptor) >= 2:
+        target = interceptor[1]
+    cleanup = getattr(target, "cleanup", None)
+    if callable(cleanup):
+        cleanup()
+
+
 def _should_bypass_proxy(base_url: str) -> bool:
     try:
         hostname = (urlparse(base_url).hostname or "").strip()
@@ -834,6 +1140,7 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
     from liveweb_arena.core.gt_collector import GTCollector, set_current_gt_collector
     from liveweb_arena.core.parser import AnswerParser
     from liveweb_arena.core.reward import RewardConfig, StepwiseRewardCalculator
+    from liveweb_arena.core.runtime_profiles import FAST_COLLECT_PROFILE, STRICT_EVAL_PROFILE
     from liveweb_arena.core.validators.llm_validator import validate_answers_with_llm
     _, _handle_navigation_event, _handle_observation_event = import_liveweb_env_symbols()
 
@@ -862,7 +1169,11 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
                 templates=job.templates,
             )
             total_expected_steps = sum(subtask.expected_steps for subtask in task.subtasks)
-            effective_max_steps = max(read_int_env("LIVEWEB_MAX_STEPS", 30), total_expected_steps)
+            phase_config = load_task_mix_config().get("phases", {}).get(str(job.phase), {})
+            configured_max_steps = int(phase_config.get("max_steps", read_int_env("LIVEWEB_MAX_STEPS", 30)))
+            if (job.failure_bucket or "") == "near_miss":
+                configured_max_steps += int(os.getenv("LIVEWEB_NEAR_MISS_STEP_BONUS", "4"))
+            effective_max_steps = max(configured_max_steps, total_expected_steps)
             target_assets: set[str] = set()
             required_domains: set[str] = set()
             reward_overrides: dict[str, float] = {}
@@ -883,7 +1194,7 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
             session = await actor.browser.new_session()
 
             exception_stage = "interceptor"
-            interceptor = await actor._setup_interceptor(
+            session, interceptor = await actor._setup_interceptor(
                 session=session,
                 cached_pages=cached_pages,
                 allowed_domains=allowed_domains,
@@ -926,6 +1237,7 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
                 max_retries=1,
                 strict_serial=True,
             )
+            runtime_profile = FAST_COLLECT_PROFILE if state._rollout_phase == "train" else STRICT_EVAL_PROFILE
 
             exception_stage = "agent_loop"
             rollout_temperature = float(
@@ -947,6 +1259,7 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
                 allowed_domains=allowed_domains,
                 on_navigation=on_navigation,
                 on_observation=on_observation,
+                runtime_profile=runtime_profile,
             )
 
             exception_stage = "gt_fetch"
@@ -987,6 +1300,12 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
                             "score": 0.0,
                             "is_correct": False,
                             "reasoning": f"Data not collected: {gt_extraction_failures[tag]}",
+                            "plugin_name": subtask.plugin_name,
+                            "required_domains": sorted(
+                                set(getattr(subtask.template, "get_required_domains")(subtask.validation_info))
+                            )
+                            if getattr(subtask, "template", None) is not None
+                            else [],
                         }
                     )
                 else:
@@ -1009,6 +1328,20 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
                     )
                 )
             answer_validations.sort(key=lambda item: item.get("answer_tag", ""))
+            subtask_by_tag = {subtask.answer_tag: subtask for subtask in task.subtasks}
+            for item in answer_validations:
+                subtask = subtask_by_tag.get(str(item.get("answer_tag") or ""))
+                if subtask is None:
+                    continue
+                item.setdefault("plugin_name", subtask.plugin_name)
+                template = getattr(subtask, "template", None)
+                if template is not None:
+                    item.setdefault(
+                        "required_domains",
+                        sorted(set(template.get_required_domains(subtask.validation_info))),
+                    )
+                else:
+                    item.setdefault("required_domains", [])
 
             hard_failures = {"agent_timeout", "llm_error", "cache_error", "site_unreachable"}
             if failure_reason and failure_reason in hard_failures:
@@ -1054,9 +1387,10 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
             collected_assets = set(gt_collector.get_collected_api_data().keys())
             collected_target_assets = target_assets & collected_assets
             confirmed_targets = target_assets & _extract_confirmed_targets(step_rewards)
+            visited_domains = set(reward_calc.get_state().get("visited_domains", []))
             progress_summary = build_progress_summary(
                 required_domains=required_domains,
-                visited_domains=reward_calc.get_state().get("visited_domains", []),
+                visited_domains=visited_domains,
                 target_assets=target_assets,
                 collected_target_assets=collected_target_assets,
                 confirmed_targets=confirmed_targets,
@@ -1069,6 +1403,34 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
                 success=success,
                 score=total_score,
                 progress_score=float(progress_summary["progress_score"]),
+            )
+            trajectory_diagnostics = _extract_trajectory_diagnostics(
+                trajectory=trajectory,
+                allowed_domains=allowed_domains,
+                required_domains=required_domains,
+            )
+            unsupported_stop = (
+                failure_reason in {None, "incomplete_data"}
+                and (
+                    (
+                        int(progress_summary.get("required_domains_total", 0)) > 0
+                        and float(progress_summary.get("required_domain_coverage", 0.0)) < 1.0
+                    )
+                    or (
+                        int(progress_summary.get("target_assets_total", 0)) > 0
+                        and float(progress_summary.get("confirmed_target_coverage", 0.0)) < 1.0
+                    )
+                )
+            )
+            hallucinated_plugin_count = _count_hallucinated_plugins(answer_validations, visited_domains)
+            rl_failure_bucket = _classify_rl_failure_bucket(
+                failure_reason=failure_reason,
+                success=success,
+                score=total_score,
+                progress_summary=progress_summary,
+                unsupported_stop=unsupported_stop,
+                hallucinated_plugin_count=hallucinated_plugin_count,
+                trajectory_diagnostics=trajectory_diagnostics,
             )
 
             result = {
@@ -1097,12 +1459,17 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
                     "plugin_name": job.plugin_name,
                     "plugin_names": list(job.plugin_names),
                     "required_domains": sorted(required_domains),
-                    "visited_domains": sorted(reward_calc.get_state().get("visited_domains", [])),
+                    "visited_domains": sorted(visited_domains),
                     "target_assets": sorted(target_assets),
                     "collected_target_assets": sorted(collected_target_assets),
                     "confirmed_targets": sorted(confirmed_targets),
                     "progress_summary": progress_summary,
                     "learning_bucket": learning_bucket,
+                    "runtime_profile": runtime_profile,
+                    "trajectory_diagnostics": trajectory_diagnostics,
+                    "unsupported_stop": unsupported_stop,
+                    "hallucinated_plugin_count": hallucinated_plugin_count,
+                    "rl_failure_bucket": rl_failure_bucket,
                     "browser_rebuild_count": state.browser_rebuild_count,
                     "browser_reuse_failures": state.browser_reuse_failures,
                     "browser_recovery_success_count": state.browser_recovery_success_count,
@@ -1145,8 +1512,7 @@ async def evaluate_prompt_job(args, state: LiveWebRolloutState, job: PromptJob) 
             set_current_gt_collector(None)
             if gt_collector is not None:
                 gt_collector.cleanup()
-            if interceptor is not None:
-                interceptor.cleanup()
+            _cleanup_interceptor_value(interceptor)
             cached_pages.clear()
             if session is not None:
                 await session.close()

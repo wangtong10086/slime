@@ -528,7 +528,7 @@ class MegatronTrainRayActor(TrainRayActor):
         original_save = self.args.save
         original_no_save_optim = getattr(self.args, "no_save_optim", False)
         self.args.save = save_dir or original_save
-        self.args.no_save_optim = save_mode != "full"
+        self.args.no_save_optim = original_no_save_optim or (save_mode != "full")
 
         if is_megatron_main_rank():
             logger.info(

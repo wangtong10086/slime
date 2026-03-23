@@ -14,8 +14,10 @@ def _write_yaml(data: dict) -> str:
 
 
 class TestSglangConfigUpdateWeights:
-    def test_update_weights_default_true(self):
-        """Models without explicit update_weights should default to True."""
+    def test_update_weights_default_true_after_resolve(self):
+        """Models without explicit update_weights should resolve to True."""
+        from argparse import Namespace
+
         from slime.backends.sglang_utils.sglang_config import SglangConfig
 
         path = _write_yaml(
@@ -30,6 +32,8 @@ class TestSglangConfigUpdateWeights:
         )
         config = SglangConfig.from_yaml(path)
         assert len(config.models) == 1
+        assert config.models[0].update_weights is None
+        config.models[0].resolve(Namespace(rollout_num_gpus_per_engine=4, hf_checkpoint=None))
         assert config.models[0].update_weights is True
 
     def test_update_weights_explicit_false(self):
@@ -127,6 +131,52 @@ class TestGetModelUrl:
             sglang_router_port=3000,
         )
         assert get_model_url(args, "anything") == "http://10.0.0.1:3000/generate"
+
+
+class TestWorkerControlHeaders:
+    def test_build_worker_control_headers_uses_arg_api_key(self, monkeypatch):
+        from argparse import Namespace
+
+        from slime.rollout.sglang_rollout import _build_worker_control_headers
+
+        monkeypatch.delenv("LIVEWEB_API_KEY", raising=False)
+        monkeypatch.delenv("API_KEY", raising=False)
+        monkeypatch.delenv("SGLANG_API_KEY", raising=False)
+
+        args = Namespace(sglang_api_key="local-liveweb")
+        headers = _build_worker_control_headers(args)
+        assert headers["Content-Type"] == "application/json; charset=utf-8"
+        assert headers["Authorization"] == "Bearer local-liveweb"
+        assert headers["X-API-Key"] == "local-liveweb"
+
+    def test_build_worker_control_headers_falls_back_to_env(self, monkeypatch):
+        from argparse import Namespace
+
+        from slime.rollout.sglang_rollout import _build_worker_control_headers
+
+        monkeypatch.setenv("SGLANG_API_KEY", "from-env")
+        monkeypatch.delenv("LIVEWEB_API_KEY", raising=False)
+        monkeypatch.delenv("API_KEY", raising=False)
+
+        args = Namespace()
+        headers = _build_worker_control_headers(args)
+        assert headers["Authorization"] == "Bearer from-env"
+        assert headers["X-API-Key"] == "from-env"
+
+
+class TestSglangControlPlaneAuth:
+    def test_raise_for_control_plane_auth_failure_raises_on_401(self):
+        import requests
+
+        from slime.backends.sglang_utils.control_plane import raise_for_control_plane_auth_failure
+
+        request = requests.Request("GET", "http://127.0.0.1:3000/get_server_info").prepare()
+        response = requests.Response()
+        response.status_code = 401
+        response.request = request
+
+        with pytest.raises(PermissionError):
+            raise_for_control_plane_auth_failure(response, "get_server_info")
 
 
 if __name__ == "__main__":

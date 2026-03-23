@@ -3,6 +3,21 @@ from __future__ import annotations
 from pathlib import Path
 
 
+def _normalize_megatron_checkpoint_dir(path_str: str) -> Path:
+    path = Path(path_str).resolve()
+    latest_file = path / "latest_checkpointed_iteration.txt"
+    if latest_file.is_file():
+        return path
+
+    if path.name.startswith("iter_"):
+        parent = path.parent
+        parent_latest = parent / "latest_checkpointed_iteration.txt"
+        if parent_latest.is_file():
+            return parent.resolve()
+
+    return path
+
+
 def resolve_liveweb_run_config(
     *,
     run_root: str,
@@ -27,7 +42,11 @@ def resolve_liveweb_run_config(
     if run_mode == "fresh":
         if resume_checkpoint_dir:
             raise ValueError("RESUME_CHECKPOINT_DIR must be empty when LIVEWEB_RUN_MODE=fresh")
-        effective_load = Path(explicit_load_checkpoint_dir).resolve() if explicit_load_checkpoint_dir else run_checkpoint_path
+        effective_load = (
+            _normalize_megatron_checkpoint_dir(explicit_load_checkpoint_dir)
+            if explicit_load_checkpoint_dir
+            else run_checkpoint_path
+        )
         return {
             "effective_load_checkpoint_dir": str(effective_load),
             "start_rollout_id_override": "",
@@ -38,7 +57,7 @@ def resolve_liveweb_run_config(
     if not resume_checkpoint_dir:
         raise ValueError("RESUME_CHECKPOINT_DIR is required when LIVEWEB_RUN_MODE=resume")
 
-    resume_checkpoint_path = Path(resume_checkpoint_dir).resolve()
+    resume_checkpoint_path = _normalize_megatron_checkpoint_dir(resume_checkpoint_dir)
     if run_root_path == resume_checkpoint_path.parent or run_checkpoint_path == resume_checkpoint_path:
         raise ValueError("RUN_ROOT must be different from the source checkpoint run when resuming")
 

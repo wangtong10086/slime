@@ -29,6 +29,25 @@ def resolve_sglang_startup_jit_config() -> tuple[bool, str]:
     return False, "disabled_by_default_for_liveweb_resume"
 
 
+def resolve_sglang_control_timeout_seconds() -> float:
+    raw = os.environ.get("LIVEWEB_SGLANG_CONTROL_TIMEOUT_SECONDS", "60").strip()
+    try:
+        timeout = float(raw)
+    except ValueError:
+        logger.warning(
+            "sglang/control_timeout_invalid raw=%s; falling back to 60s",
+            raw,
+        )
+        return 60.0
+    if timeout <= 0:
+        logger.warning(
+            "sglang/control_timeout_nonpositive raw=%s; falling back to 60s",
+            raw,
+        )
+        return 60.0
+    return timeout
+
+
 def _patch_sglang_startup_for_liveweb() -> None:
     enabled, reason = resolve_sglang_startup_jit_config()
     logging.getLogger(__name__).info(
@@ -80,7 +99,16 @@ def _build_headers(api_key: str | None) -> dict[str, str]:
     headers = {"Content-Type": "application/json; charset=utf-8"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+        headers["X-API-Key"] = api_key
     return headers
+
+
+def _raise_for_control_plane_auth_failure(response: requests.Response, endpoint: str) -> None:
+    if response.status_code in {401, 403}:
+        raise PermissionError(
+            f"Unauthorized control-plane access for endpoint={endpoint!r}, "
+            f"status_code={response.status_code}, url={response.request.url!r}"
+        )
 
 
 def get_base_gpu_id(args, rank):
@@ -134,11 +162,17 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
 
 def _wait_server_healthy(base_url, api_key, is_process_alive):
     headers = _build_headers(api_key)
+    timeout = resolve_sglang_control_timeout_seconds()
 
     with _build_requests_session(base_url) as session:
         while True:
             try:
-                response = session.get(f"{base_url}/health_generate", headers=headers)
+                response = session.get(
+                    f"{base_url}/health_generate",
+                    headers=headers,
+                    timeout=timeout,
+                )
+                _raise_for_control_plane_auth_failure(response, "health_generate")
                 if response.status_code == 200:
                     break
             except requests.RequestException:
@@ -225,9 +259,18 @@ class SGLangEngine(RayActor):
 
     def _init_external(self, expect_server_args, external_engine_need_check_fields):
         logger.info(f"Use external SGLang engine (rank={self.rank}, expect_server_args={expect_server_args})")
+        base_url = f"http://{self.server_host}:{self.server_port}"
+        timeout = resolve_sglang_control_timeout_seconds()
+        headers = _build_headers(self.server_api_key)
 
         def _get_actual_server_args():
-            response = requests.get(f"http://{self.server_host}:{self.server_port}/get_server_info")
+            with _build_requests_session(base_url) as session:
+                response = session.get(
+                    f"{base_url}/get_server_info",
+                    headers=headers,
+                    timeout=timeout,
+                )
+            _raise_for_control_plane_auth_failure(response, "get_server_info")
             response.raise_for_status()
             return response.json()
 
@@ -240,8 +283,8 @@ class SGLangEngine(RayActor):
                 ), f"{name=} {expect_value=} {actual_value=} {expect_server_args=} {actual_server_args=}"
 
         _wait_server_healthy(
-            base_url=f"http://{self.server_host}:{self.server_port}",
-            api_key=None,
+            base_url=base_url,
+            api_key=self.server_api_key,
             is_process_alive=lambda: True,
         )
         actual_server_args = _get_actual_server_args()
@@ -252,24 +295,32 @@ class SGLangEngine(RayActor):
         self.process = launch_server_process(ServerArgs(**server_args_dict))
 
         if self.node_rank == 0 and self.router_ip and self.router_port:
+            router_base_url = f"http://{self.router_ip}:{self.router_port}"
+            headers = _build_headers(self.server_api_key)
             if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
                 assert (
                     self.worker_type == "regular"
                 ), "pd disaggregation is not supported in old router or slime router."
-                response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/add_worker?url=http://{self.server_host}:{self.server_port}"
-                )
+                with _build_requests_session(router_base_url) as session:
+                    response = session.post(
+                        f"{router_base_url}/add_worker?url=http://{self.server_host}:{self.server_port}",
+                        headers=headers,
+                    )
             else:
                 payload = {
                     "url": f"http://{self.server_host}:{self.server_port}",
                     "worker_type": self.worker_type,
+                    "api_key": self.server_api_key,
                 }
                 if self.worker_type == "prefill":
                     payload["bootstrap_port"] = server_args_dict["disaggregation_bootstrap_port"]
-                response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/workers",
-                    json=payload,
-                )
+                with _build_requests_session(router_base_url) as session:
+                    response = session.post(
+                        f"{router_base_url}/workers",
+                        json=payload,
+                        headers=headers,
+                    )
+            _raise_for_control_plane_auth_failure(response, "router_register_worker")
             response.raise_for_status()
 
     def _make_request(self, endpoint: str, payload: dict | None = None):
@@ -286,12 +337,23 @@ class SGLangEngine(RayActor):
             return
 
         url = f"http://{self.server_host}:{self.server_port}/{endpoint}"
-        with _build_requests_session(url) as session:
-            response = session.post(url, json=payload or {}, headers=_build_headers(self.server_api_key))
+        timeout = resolve_sglang_control_timeout_seconds()
         try:
+            with _build_requests_session(url) as session:
+                response = session.post(
+                    url,
+                    json=payload or {},
+                    headers=_build_headers(self.server_api_key),
+                    timeout=timeout,
+                )
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
             e.add_note(f"{response.text=}")
+            raise
+        except requests.exceptions.RequestException as e:
+            e.add_note(
+                f"endpoint={endpoint!r}, timeout={timeout}, host={self.server_host!r}, port={self.server_port!r}"
+            )
             raise
         return response.json()
 
@@ -373,24 +435,35 @@ class SGLangEngine(RayActor):
 
         logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
         if self.node_rank == 0:
+            router_base_url = f"http://{self.router_ip}:{self.router_port}"
+            headers = _build_headers(self.server_api_key)
             worker_url = f"http://{self.server_host}:{self.server_port}"
             response = None
             if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
-                response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/remove_worker?url=http://{self.server_host}:{self.server_port}"
-                )
+                with _build_requests_session(router_base_url) as session:
+                    response = session.post(
+                        f"{router_base_url}/remove_worker?url=http://{self.server_host}:{self.server_port}",
+                        headers=headers,
+                    )
             elif parse(sglang_router.__version__) < parse("0.3.0"):
                 worker_url = quote(worker_url, safe="")
-                response = requests.delete(f"http://{self.router_ip}:{self.router_port}/workers/{worker_url}")
+                with _build_requests_session(router_base_url) as session:
+                    response = session.delete(f"{router_base_url}/workers/{worker_url}", headers=headers)
             else:
                 try:
-                    all_workers = requests.get(f"http://{self.router_ip}:{self.router_port}/workers").json()["workers"]
+                    with _build_requests_session(router_base_url) as session:
+                        list_response = session.get(f"{router_base_url}/workers", headers=headers)
+                    _raise_for_control_plane_auth_failure(list_response, "router_list_workers")
+                    list_response.raise_for_status()
+                    all_workers = list_response.json()["workers"]
                     for worker in all_workers:
                         if worker["url"] == worker_url:
                             worker_id = worker["id"]
-                            response = requests.delete(
-                                f"http://{self.router_ip}:{self.router_port}/workers/{worker_id}"
-                            )
+                            with _build_requests_session(router_base_url) as session:
+                                response = session.delete(
+                                    f"{router_base_url}/workers/{worker_id}",
+                                    headers=headers,
+                                )
                             break
                     else:
                         logger.warning(f"Worker {worker_url} not found in router during shutdown.")
@@ -398,6 +471,7 @@ class SGLangEngine(RayActor):
                     logger.warning(f"Failed to fetch workers list or remove worker: {e}")
 
             if response is not None:
+                _raise_for_control_plane_auth_failure(response, "router_remove_worker")
                 response.raise_for_status()
         kill_process_tree(self.process.pid)
 

@@ -21,6 +21,25 @@ def test_resolve_liveweb_run_config_fresh_uses_run_checkpoint_dir(tmp_path):
     assert resolved["start_rollout_id_override"] == ""
 
 
+def test_resolve_liveweb_run_config_fresh_normalizes_iter_dir_to_checkpoint_root(tmp_path):
+    run_root = tmp_path / "run"
+    checkpoint_dir = run_root / "checkpoints"
+    checkpoint_dir.mkdir(parents=True)
+    (checkpoint_dir / "latest_checkpointed_iteration.txt").write_text("8")
+    iter_dir = checkpoint_dir / "iter_0000008"
+    iter_dir.mkdir()
+
+    resolved = resolve_liveweb_run_config(
+        run_root=str(run_root),
+        run_checkpoint_dir=str(checkpoint_dir),
+        run_mode="fresh",
+        resume_mode="checkpoint",
+        explicit_load_checkpoint_dir=str(iter_dir),
+    )
+
+    assert resolved["effective_load_checkpoint_dir"] == str(checkpoint_dir.resolve())
+
+
 def test_resolve_liveweb_run_config_resume_requires_new_run_dir(tmp_path):
     run_root = tmp_path / "run"
     checkpoint_dir = run_root / "checkpoints"
@@ -59,6 +78,30 @@ def test_resolve_liveweb_run_config_hf_only_derives_latest_export(tmp_path):
     assert resolved["effective_load_checkpoint_dir"] == str(hf_export_dir.resolve())
     assert resolved["hf_only_load_dir"] == str(hf_export_dir.resolve())
     assert resolved["start_rollout_id_override"] == "8"
+
+
+def test_resolve_liveweb_run_config_resume_normalizes_iter_dir_to_checkpoint_root(tmp_path):
+    source_run = tmp_path / "source"
+    resume_checkpoint_dir = source_run / "checkpoints"
+    resume_checkpoint_dir.mkdir(parents=True)
+    (resume_checkpoint_dir / "latest_checkpointed_iteration.txt").write_text("7")
+    iter_dir = resume_checkpoint_dir / "iter_0000007"
+    iter_dir.mkdir()
+
+    new_run = tmp_path / "new-run"
+    new_checkpoint_dir = new_run / "checkpoints"
+    new_checkpoint_dir.mkdir(parents=True)
+
+    resolved = resolve_liveweb_run_config(
+        run_root=str(new_run),
+        run_checkpoint_dir=str(new_checkpoint_dir),
+        run_mode="resume",
+        resume_mode="checkpoint",
+        resume_checkpoint_dir=str(iter_dir),
+    )
+
+    assert resolved["effective_load_checkpoint_dir"] == str(resume_checkpoint_dir.resolve())
+    assert resolved["resume_checkpoint_dir"] == str(resume_checkpoint_dir.resolve())
 
 
 def test_validate_resume_rollout_range_rejects_empty_range():

@@ -209,6 +209,7 @@ def init_http_client(args):
         _http_client = httpx.AsyncClient(
             limits=httpx.Limits(max_connections=_client_concurrency),
             timeout=httpx.Timeout(None),
+            trust_env=False,
         )
 
     # Optionally initialize distributed POST via Ray without changing interfaces
@@ -243,6 +244,7 @@ def _init_ray_distributed_post(args):
             self._client = httpx.AsyncClient(
                 limits=httpx.Limits(max_connections=max(1, concurrency)),
                 timeout=httpx.Timeout(None),
+                trust_env=False,
             )
 
         async def do_post(self, url, payload, max_retries=60, headers=None):
@@ -288,8 +290,8 @@ async def post(url, payload, max_retries=60, headers=None):
     return await _post(_http_client, url, payload, max_retries, headers=headers)
 
 
-async def get(url):
-    response = await _http_client.get(url)
+async def get(url, headers=None):
+    response = await _http_client.get(url, headers=headers)
     response.raise_for_status()
     content = await response.aread()
     output = json.loads(content)

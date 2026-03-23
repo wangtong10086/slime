@@ -42,11 +42,22 @@ _MAX_METRIC_KEYS = {
     "scheduler/runtime_queued_jobs",
     "env/jit_kernel_enabled",
     "env/kernel_fallback",
+    "env/pending_samples",
+    "env/pending_groups",
+    "env/oldest_pending_age_seconds",
+    "env/active_decode_requests",
 }
 
 _CONST_METRIC_KEYS = {
     "scheduler/config_max_parallel_env_jobs",
     "scheduler/config_max_parallel_llm_jobs",
+}
+
+_ABSOLUTE_RUNTIME_METRIC_KEYS = {
+    "pending_samples",
+    "pending_groups",
+    "oldest_pending_age_seconds",
+    "active_decode_requests",
 }
 
 
@@ -392,6 +403,20 @@ def _run_groups(args, groups: list[list[Sample]], evaluation: bool, rollout_id: 
                 ) if group_results else 0.0,
                 "accepted": False,
                 "zero_std": zero_std,
+                "task_records": [
+                    {
+                        "task_id": ((item.raw_result.get("extra") or {}).get("task_id")),
+                        "rl_failure_bucket": (
+                            (item.raw_result.get("extra") or {}).get("rl_failure_bucket")
+                            or (item.raw_result.get("extra") or {}).get("learning_bucket")
+                        ),
+                        "failure_reason": ((item.raw_result.get("extra") or {}).get("failure_reason")),
+                        "unsupported_stop": bool((item.raw_result.get("extra") or {}).get("unsupported_stop")),
+                        "score": float(item.reward),
+                        "success": bool(item.success),
+                    }
+                    for item in group_results
+                ],
             }
         )
         if zero_std:
@@ -435,13 +460,21 @@ def _run_groups(args, groups: list[list[Sample]], evaluation: bool, rollout_id: 
         "scheduler/config_max_parallel_llm_jobs": float(max_parallel_llm_jobs),
     }
     metrics["scheduler/active_jobs"] = metrics["scheduler/runtime_active_job_cap"]
+    metrics["scheduler/active_env_jobs_mean"] = metrics["scheduler/runtime_active_job_cap"]
+    metrics["scheduler/active_llm_jobs_mean"] = min(
+        metrics["scheduler/runtime_active_job_cap"],
+        metrics["scheduler/config_max_parallel_llm_jobs"],
+    )
     metrics["scheduler/queued_jobs"] = metrics["scheduler/runtime_queued_jobs"]
     metrics["scheduler/completed_jobs"] = metrics["scheduler/runtime_completed_jobs"]
     metrics["scheduler/max_parallel_env_jobs"] = metrics["scheduler/config_max_parallel_env_jobs"]
     metrics["scheduler/max_parallel_llm_jobs"] = metrics["scheduler/config_max_parallel_llm_jobs"]
     metrics_after = state.snapshot_runtime_metrics(scope=scope)
     for key, value in metrics_after.items():
-        metrics[f"env/{key}"] = float(value - metrics_before.get(key, 0))
+        if key in _ABSOLUTE_RUNTIME_METRIC_KEYS:
+            metrics[f"env/{key}"] = float(value)
+        else:
+            metrics[f"env/{key}"] = float(value - metrics_before.get(key, 0))
     if all_results:
         runtime_reset_count = metrics.get("env/runtime_reset_count", 0.0)
         runtime_pool_hits = metrics.get("env/runtime_pool_hits", 0.0)

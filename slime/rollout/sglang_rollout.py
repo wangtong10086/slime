@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import copy
+import os
 import inspect
 import logging
 import uuid
@@ -9,12 +11,15 @@ from contextlib import contextmanager
 from typing import Any
 
 import numpy as np
-import pybase64
-import sglang_router
+import requests
 from packaging.version import parse
 from tqdm import tqdm
 
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
+from slime.backends.sglang_utils.control_plane import (
+    build_control_plane_headers,
+    raise_for_control_plane_auth_failure,
+)
 from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
 from slime.utils.async_utils import run
 from slime.utils.data import Dataset
@@ -29,11 +34,124 @@ from slime.utils.processing_utils import (
 )
 from slime.utils.types import Sample
 
-from .rm_hub import async_rm, batched_async_rm
-
 __all__ = ["generate_rollout", "get_model_url"]
 
 logger = logging.getLogger(__name__)
+
+try:
+    import pybase64 as _fast_base64
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    _fast_base64 = None
+
+try:
+    import sglang_router as _sglang_router
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    class _MissingSglangRouter:
+        __version__ = "0.0.0"
+
+    _sglang_router = _MissingSglangRouter()
+
+
+def _decode_base64_ascii(value: str) -> bytes:
+    if _fast_base64 is not None:
+        return _fast_base64.b64decode(value.encode("ascii"))
+    return base64.b64decode(value.encode("ascii"))
+
+
+def _build_worker_control_headers(args: Namespace) -> dict[str, str]:
+    return build_control_plane_headers(args)
+
+
+def _header_variants_from_headers(headers: dict[str, str]) -> list[dict[str, str]]:
+    base = {"Content-Type": headers.get("Content-Type", "application/json; charset=utf-8")}
+    auth_value = headers.get("Authorization", "").strip()
+    x_api_key = headers.get("X-API-Key", "").strip()
+    variants = [headers]
+    if auth_value:
+        variants.append({**base, "Authorization": auth_value})
+    if x_api_key:
+        variants.append({**base, "X-API-Key": x_api_key})
+    if auth_value and auth_value.lower().startswith("bearer "):
+        raw_key = auth_value.split(" ", 1)[1].strip()
+        if raw_key:
+            variants.append({**base, "Authorization": raw_key})
+            variants.append({**base, "Authorization": f"Bearer {raw_key}", "X-API-Key": raw_key})
+    deduped: list[dict[str, str]] = []
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    for variant in variants:
+        marker = tuple(sorted(variant.items()))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        deduped.append(variant)
+    return deduped
+
+
+def _resolve_abort_grace_seconds() -> float:
+    raw = os.getenv("LIVEWEB_ABORT_GRACE_SECONDS", "10").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("abort_grace_seconds_invalid raw=%s; using 10s", raw)
+        return 10.0
+    return max(1.0, value)
+
+
+def _load_rm_functions():
+    from .rm_hub import async_rm, batched_async_rm
+
+    return async_rm, batched_async_rm
+
+
+async def _control_get_json(url: str, headers: dict[str, str], timeout: float = 10.0) -> dict[str, Any]:
+    def _request_once(header_variant: dict[str, str]) -> requests.Response:
+        session = requests.Session()
+        session.trust_env = False
+        return session.get(url, headers=header_variant, timeout=timeout)
+
+    last_auth_error: requests.Response | None = None
+    for variant in _header_variants_from_headers(headers):
+        response = await asyncio.to_thread(_request_once, variant)
+        if response.status_code in {401, 403}:
+            last_auth_error = response
+            continue
+        response.raise_for_status()
+        return response.json()
+
+    if last_auth_error is not None:
+        raise_for_control_plane_auth_failure(last_auth_error, url)
+    raise RuntimeError(f"control-plane GET failed for {url}")
+
+
+async def _control_post_json(
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    timeout: float = 10.0,
+) -> dict[str, Any] | str | None:
+    def _request_once(header_variant: dict[str, str]) -> requests.Response:
+        session = requests.Session()
+        session.trust_env = False
+        return session.post(url, json=payload, headers=header_variant, timeout=timeout)
+
+    last_auth_error: requests.Response | None = None
+    for variant in _header_variants_from_headers(headers):
+        response = await asyncio.to_thread(_request_once, variant)
+        if response.status_code in {401, 403}:
+            last_auth_error = response
+            continue
+        response.raise_for_status()
+        text = response.text
+        if not text:
+            return None
+        try:
+            return response.json()
+        except Exception:
+            return text
+
+    if last_auth_error is not None:
+        raise_for_control_plane_auth_failure(last_auth_error, url)
+    raise RuntimeError(f"control-plane POST failed for {url}")
 
 
 def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate") -> str:
@@ -211,7 +329,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
 
     if "routed_experts" in output["meta_info"]:
         sample.rollout_routed_experts = np.frombuffer(
-            pybase64.b64decode(output["meta_info"]["routed_experts"].encode("ascii")),
+            _decode_base64_ascii(output["meta_info"]["routed_experts"]),
             dtype=np.int32,
         ).reshape(
             len(sample.tokens) - 1,
@@ -266,6 +384,8 @@ async def generate_and_rm(
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
         return sample
+
+    async_rm, batched_async_rm = _load_rm_functions()
 
     # multi samples
     if isinstance(sample, list):
@@ -329,32 +449,71 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     state = GenerateState(args)
     assert not state.aborted
     state.aborted = True
+    headers = _build_worker_control_headers(args)
+    abort_grace_seconds = _resolve_abort_grace_seconds()
 
-    if parse(sglang_router.__version__) <= parse("0.2.1") or args.use_slime_router:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
+    if parse(_sglang_router.__version__) <= parse("0.2.1") or args.use_slime_router:
+        response = await _control_get_json(
+            f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers",
+            headers=headers,
+        )
         urls = response["urls"]
     else:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
+        response = await _control_get_json(
+            f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers",
+            headers=headers,
+        )
         urls = [worker["url"] for worker in response["workers"]]
 
     logger.info(f"Abort request for {urls}")
-    abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
+    abort_tasks = [_control_post_json(f"{url}/abort_request", {"abort_all": True}, headers=headers) for url in urls]
     abort_results = await asyncio.gather(*abort_tasks, return_exceptions=True)
     for url, result in zip(urls, abort_results, strict=False):
         if isinstance(result, Exception):
             logger.warning(f"Failed to abort worker at {url}: {result}")
 
-    # make sure all the pending tasks are finished
+    # Make a bounded best-effort attempt to collect/cancel pending tasks.
+    deadline = asyncio.get_running_loop().time() + abort_grace_seconds
     count = 0
     while state.pendings:
-        done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            logger.warning(
+                "Abort grace period exhausted with %s pending tasks; cancelling locally to unblock rollout",
+                len(state.pendings),
+            )
+            for task in list(state.pendings):
+                task.cancel()
+            done, pending = await asyncio.wait(state.pendings, timeout=1.0)
+            state.pendings = set(pending)
+            if state.pendings:
+                logger.warning(
+                    "Dropping %s stubborn pending tasks after local cancellation",
+                    len(state.pendings),
+                )
+                state.pendings.clear()
+            break
+
+        done, state.pendings = await asyncio.wait(
+            state.pendings,
+            timeout=min(remaining, 1.0),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            continue
 
         if not args.partial_rollout:
             continue
 
         # for partial rollout, collect the partial samples into the data buffer
         for task in done:
-            group = task.result()
+            try:
+                group = task.result()
+            except asyncio.CancelledError:
+                continue
+            except Exception as exc:
+                logger.warning("Pending rollout task finished with error during abort: %s", exc)
+                continue
             for sample in group:
                 if sample.response and "start_rollout_id" not in sample.metadata:
                     sample.metadata["start_rollout_id"] = rollout_id

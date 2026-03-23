@@ -25,6 +25,7 @@ from megatron.training.training import get_model
 
 from slime.utils import logging_utils
 from slime.utils.memory_utils import clear_memory
+from slime.utils.train_logging_helpers import next_train_log_step, normalize_grad_norm_for_logging
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
@@ -48,7 +49,10 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
         OptimizerParamScheduler: Initialized scheduler bound to ``optimizer``.
     """
     # Iteration-based training.
-    args.train_iters = args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+    args.train_iters = max(
+        1,
+        args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size,
+    )
     if args.lr_decay_iters is None:
         args.lr_decay_iters = args.train_iters
     lr_decay_steps = args.lr_decay_iters * args.global_batch_size
@@ -642,7 +646,19 @@ def train(
                 f"train/{role_tag}{key}": val.mean().item() if isinstance(val, torch.Tensor) else val
                 for key, val in loss_dict.items()
             }
-            log_dict[f"train/{role_tag}grad_norm"] = grad_norm
+            raw_grad_norm = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+            effective_grad_norm, logged_raw_grad_norm = normalize_grad_norm_for_logging(
+                raw_grad_norm,
+                getattr(args, "clip_grad", None),
+            )
+            log_dict[f"train/{role_tag}grad_norm"] = effective_grad_norm
+            log_dict[f"train/{role_tag}raw_grad_norm"] = logged_raw_grad_norm
+            if getattr(args, "clip_grad", None):
+                log_dict[f"train/{role_tag}grad_clip_ratio"] = (
+                    float(logged_raw_grad_norm) / float(args.clip_grad)
+                    if math.isfinite(float(logged_raw_grad_norm)) and float(args.clip_grad) > 0
+                    else 0.0
+                )
             if args.enable_mtp_training:
                 log_dict[f"train/{role_tag}mtp_loss"] = mtp_losses
 
@@ -703,7 +719,8 @@ def train(
                     if math.isfinite(loss_value):
                         log_dict[f"train/{role_tag}perplexity"] = math.exp(min(loss_value, 20.0))
 
-            log_dict["train/step"] = accumulated_step_id
+            log_dict["train/internal_step"] = accumulated_step_id
+            log_dict["train/step"] = next_train_log_step(args)
             logging_utils.log(args, log_dict, step_key="train/step")
 
             if args.ci_test and not args.ci_disable_kl_checker:

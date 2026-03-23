@@ -1,6 +1,10 @@
 {
   "stable_plugins": [
-    "hackernews"
+    "hackernews",
+    "coingecko",
+    "stooq",
+    "taostats",
+    "hybrid"
   ],
   "full_plugins": [
     "hackernews",
@@ -9,14 +13,87 @@
     "taostats",
     "hybrid"
   ],
+  "phase_aliases": {
+    "warmup": "bootstrap",
+    "main": "main_warm"
+  },
   "phases": {
-    "warmup": {
-      "stable_weight": 1.0,
-      "full_weight": 0.0
+    "bootstrap": {
+      "plugin_weights": {
+        "stooq": 0.5,
+        "coingecko": 0.5
+      },
+      "num_task_weights": {
+        "1": 0.5,
+        "2": 0.5
+      },
+      "bucket_ratios": {
+        "normal": 0.2,
+        "wrong_domain_loop": 0.45,
+        "premature_stop": 0.25,
+        "near_miss": 0.1
+      },
+      "max_steps": 18,
+      "kl_loss_coef": 0.0
     },
-    "main": {
-      "stable_weight": 0.35,
-      "full_weight": 0.65
+    "main_warm": {
+      "plugin_weights": {
+        "stooq": 0.34,
+        "coingecko": 0.34,
+        "hackernews": 0.32
+      },
+      "num_task_weights": {
+        "2": 0.5,
+        "3": 0.5
+      },
+      "bucket_ratios": {
+        "normal": 0.35,
+        "wrong_domain_loop": 0.3,
+        "premature_stop": 0.2,
+        "near_miss": 0.15
+      },
+      "max_steps": 24,
+      "kl_loss_coef": 0.0
+    },
+    "online_align": {
+      "plugin_weights": {
+        "stooq": 0.2,
+        "coingecko": 0.2,
+        "hackernews": 0.2,
+        "taostats": 0.2,
+        "hybrid": 0.2
+      },
+      "num_task_weights": {
+        "2": 0.3333333333,
+        "3": 0.3333333333,
+        "4": 0.3333333334
+      },
+      "bucket_ratios": {
+        "normal": 0.5,
+        "wrong_domain_loop": 0.2,
+        "premature_stop": 0.1,
+        "near_miss": 0.2
+      },
+      "max_steps": 30,
+      "kl_loss_coef": 0.005
+    }
+  },
+  "curriculum": {
+    "bootstrap": {
+      "next_phase": "main_warm",
+      "thresholds": {
+        "wrong_domain_loop_rate_lte": 0.35,
+        "unsupported_stop_rate_lte": 0.2,
+        "mean_score_gte": 0.2
+      }
+    },
+    "main_warm": {
+      "next_phase": "online_align",
+      "thresholds": {
+        "mean_score_gte": 0.35,
+        "near_miss_rate_gte": 0.2,
+        "max_steps_reached_rate_delta_lte": -0.01
+      }
     }
   }
 }

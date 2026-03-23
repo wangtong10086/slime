@@ -3,54 +3,12 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from slime.utils.toolcall_health import extract_assistant_response_text, preserve_structured_conversation
 from slime.utils.types import Sample
 
 
-def extract_assistant_response_text(conversation: list[dict[str, Any]]) -> str:
-    parts: list[str] = []
-    for message in conversation:
-        if message.get("role") != "assistant":
-            continue
-        if isinstance(message.get("content"), str) and message["content"]:
-            parts.append(message["content"])
-            continue
-        for tool_call in message.get("tool_calls") or []:
-            function = tool_call.get("function", {})
-            parts.append(
-                json.dumps(
-                    {
-                        "name": function.get("name"),
-                        "arguments": function.get("arguments"),
-                    },
-                    ensure_ascii=False,
-                )
-            )
-    return "\n".join(parts)
-
-
 def normalize_conversation_for_training(conversation: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    normalized: list[dict[str, Any]] = []
-    for message in conversation:
-        msg = dict(message)
-        if msg.get("role") == "assistant":
-            parts: list[str] = []
-            if isinstance(msg.get("content"), str) and msg["content"]:
-                parts.append(msg["content"])
-            for tool_call in msg.get("tool_calls") or []:
-                function = tool_call.get("function", {})
-                parts.append(
-                    json.dumps(
-                        {
-                            "name": function.get("name"),
-                            "arguments": function.get("arguments"),
-                        },
-                        ensure_ascii=False,
-                    )
-                )
-            if parts:
-                msg["content"] = "\n".join(parts)
-        normalized.append(msg)
-    return normalized
+    return preserve_structured_conversation(conversation)
 
 
 def _normalize_token_ids(encoded: Any) -> list[int]:
